@@ -48,4 +48,28 @@ struct hyf_nand_options {
  */
 int hyf_nand_write(const struct hyf_nand_options *options);
 
+struct hyf_nand_read_options {
+    /* New OOB-only output; existing files and symlinks are never replaced. */
+    const char *oob_path;
+    /* Physical MAIN-byte coordinates, aligned to 2048-byte pages, not OOB
+     * file offsets. A zero length selects the remainder of the 256-MiB chip.
+     */
+    uint64_t address;
+    uint64_t length;
+    bool dry_run;
+};
+
+/* Capture all 128 raw spare bytes of each selected physical page in order.
+ * Only spare bytes cross USB: the chip still loads each page into its cache.
+ * ECC is temporarily disabled and the original B0 configuration restored;
+ * OTP mode is refused. A0, WEL and main/spare flash contents are not changed.
+ * No erase, program, write-enable or write-disable commands are issued.
+ *
+ * The caller initializes the chosen programmer, except for dry_run, which
+ * validates the range/new output path without SPI/USB or file creation.
+ * Interrupted/failed captures retain their partial output and return -1.
+ * Returns 0 only after the complete file and ordinary cleanup succeed.
+ */
+int hyf_nand_read_oob(const struct hyf_nand_read_options *options);
+
 #endif

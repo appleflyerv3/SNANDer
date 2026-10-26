@@ -42,9 +42,14 @@ TEST_CFLAGS = -O1 -std=c99 -Wall -Wextra -Werror -UNDEBUG
 	mkdir -p ../build
 	$(CC) $(TEST_CFLAGS) -I. tests/test_hyf_nand.c hyf_nand.c -o $@
 
-check: ../build/test_ch347_spi ../build/test_hyf_nand
+../build/test_hyf_oob_read: tests/test_hyf_oob_read.c hyf_nand.c hyf_nand.h programmer.h
+	mkdir -p ../build
+	$(CC) $(TEST_CFLAGS) -I. tests/test_hyf_oob_read.c hyf_nand.c -o $@
+
+check: ../build/test_ch347_spi ../build/test_hyf_nand ../build/test_hyf_oob_read
 	../build/test_ch347_spi
 	../build/test_hyf_nand
+	../build/test_hyf_oob_read
 
 clean:
 	rm -f $(OBJS) $(OBJS:.o=.d) SNANDer

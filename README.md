@@ -29,7 +29,8 @@ power it simultaneously from the programmer and dictionary batteries.
 
 ## Separate main and OOB files
 
-The new writer is deliberately specific to **HYF2GQ4UAACAE, ID C9:52**:
+The new separate-OOB operations are deliberately specific to
+**HYF2GQ4UAACAE, ID C9:52**:
 
 - 2048 main bytes plus 128 OOB bytes per page;
 - 64 pages per 128 KiB main-data erase block;
@@ -37,13 +38,14 @@ The new writer is deliberately specific to **HYF2GQ4UAACAE, ID C9:52**:
 
 OOB is accessed through each page's cache column, not a second flat flash
 address space. `-a` and `-l` always describe **physical main-area bytes** in
-these modes. Both must be multiples of `0x20000`; omitted length means the
+these modes. Writes require multiples of `0x20000` (one erase block);
+OOB reads require multiples of `0x800` (one page). Omitted length means the
 remainder of the chip. No bad-block skipping, remapping or logical-address
 translation occurs. Anyka OOB tags are preserved as supplied, not interpreted
 as a generic bad-block map. This is intended for same-device physical
 captures; it is not a transplant tool for NAND chips with different bad blocks.
 
-Each input must be either a full-chip file or exactly the selected range's
+Each write input must be either a full-chip file or exactly the selected range's
 slice. For a full-chip input, the writer seeks to the corresponding physical
 offset. For a slice it starts at byte zero. Main and OOB are mapped independently.
 OOB slice size is main range length divided by 16.
@@ -59,6 +61,41 @@ sizes. From `/home/appleflyer/dict`, a **non-writing** plan is:
 `--dry-run` checks file types/sizes and range alignment. It does not open USB,
 read every file byte, validate captured ECC mathematically or prove that the
 inputs belong to the connected chip.
+
+### Read only OOB
+
+Save all raw spare bytes using CH347, without transferring the main bytes:
+
+```sh
+cd /home/appleflyer/dict
+sudo ./SNANDer/src/SNANDer -p ch347 --read-oob hyf2gq4_oob_new.bin
+```
+
+Use `-p ch341a` instead for the original programmer. The full-chip output is
+16 MiB: 128 raw OOB bytes per physical page, in ascending page order, with
+no headers or skipped pages. It has the same layout as `hyf2gq4_oob.bin`.
+The output must be a **new file**; existing files and symlinks are refused.
+
+To capture only block 263's OOB (8192 bytes), for example:
+
+```sh
+sudo ./SNANDer/src/SNANDer -p ch347 --read-oob block263_oob.bin \
+  -a 0x020e0000 -l 0x20000
+```
+
+`-a`/`-l` describe the main-area span, not offsets into the OOB file. Smaller
+page-aligned ranges are also supported. Append `--dry-run` to check the range
+and output-name availability without opening USB or creating a file.
+
+Reading temporarily disables on-die ECC to capture **all** raw OOB bytes,
+including parity, and restores the original configuration afterward where
+communication permits. No `-d` is needed, and `--oob-mode` and `-v` are write-only.
+Each NAND page is loaded into its internal cache, then only cache column
+`0x0800` onward is transferred over USB. No erase/program commands or flash
+protection changes occur. Memory use is page-sized, not a full-chip allocation.
+On interruption/read/output failure, the command returns an error and keeps
+the partial file, reporting how many output bytes were written. Do not treat
+a failed capture as a complete dump.
 
 ### Two OOB modes
 
@@ -145,5 +182,6 @@ make -C src -j1 check
 
 The checks cover CH347 framing/failures and HYF main/OOB preservation, range
 mapping (full-chip files and slices), optional verification, ECC-mode handling
-and failure cleanup. NAND fixtures use only a few blocks of actual disk/RAM;
+and failure cleanup, plus raw OOB-only reads with fake programmer calls.
+NAND fixtures use only a few blocks of actual disk/RAM;
 full-chip input mapping is tested with sparse files, not a full-chip buffer.

@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
- * HYF2GQ4UAACAE physical main/OOB writer.
+ * HYF2GQ4UAACAE physical main/OOB writer and raw spare reader.
  * Primary reference: HY SPI 2G v2.7, pp9-14,20-22,26,28-34:
  * https://datasheet.lcsc.com/datasheet/pdf/cb04af556e5204a6f44a4350d72f54c9.pdf
  * The PX2131 OEM uses spare metadata as content; no generic bad-block marker
@@ -14,6 +14,7 @@
 #include "programmer.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <inttypes.h>
 #include <signal.h>
 #include <stdio.h>
@@ -655,6 +656,301 @@ cleanup:
 
         fprintf(stderr, "%" PRIu64 " block(s) completed before failure/interruption/cleanup;"
                 " no automatic recovery.\n", completed);
+    }
+
+    return result;
+}
+
+/* Unlike an erased block being rewritten, a read may stop between any two
+ * commands. Keep this interruptible wait separate from the writer's wait:
+ * the writer deliberately finishes a block after its erase has begun.
+ */
+static int wait_read_ready(void)
+{
+    struct timespec start;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &start) < 0) {
+        perror("CLOCK_MONOTONIC");
+        return -1;
+    }
+
+    for (;;) {
+        unsigned char status = 0;
+        struct timespec now;
+
+        if (stop_requested || get_feature(FEATURE_STATUS, &status) < 0) {
+            return -1;
+        }
+
+        if ((status & STATUS_BUSY) == 0) {
+            return 0;
+        }
+
+        if (clock_gettime(CLOCK_MONOTONIC, &now) < 0) {
+            perror("CLOCK_MONOTONIC");
+            return -1;
+        }
+
+        if (now.tv_sec - start.tv_sec > 2 ||
+            (now.tv_sec - start.tv_sec == 2 && now.tv_nsec >= start.tv_nsec)) {
+            fprintf(stderr, "HYF read busy timeout (2 seconds, status=%02x).\n", status);
+            return -1;
+        }
+
+        const struct timespec delay = {0, 1000000};
+
+        (void)nanosleep(&delay, NULL);
+    }
+}
+
+static int read_spare_page(uint32_t row, unsigned char spare[SPARE_PAGE])
+{
+    /* Cache column 0x0800 skips all 2048 main bytes. The NAND internally
+     * loads a whole page, but only its 128 spare bytes are transferred.
+     */
+    const unsigned char command[] = {0x03, 0x08, 0x00, 0xff};
+
+    if (stop_requested || row_command(0x13, row) < 0 ||
+        wait_read_ready() < 0 || stop_requested ||
+        transfer(command, sizeof(command), spare, SPARE_PAGE) < 0) {
+        fprintf(stderr, "HYF OOB read stopped/failed at physical row 0x%05"
+                PRIx32 ".\n", row);
+        return -1;
+    }
+
+    return 0;
+}
+
+static int require_new_output(const char *path)
+{
+    struct stat info;
+
+    /* lstat also rejects dangling symlinks. O_EXCL below closes the race
+     * between this read-only check and the actual file creation.
+     */
+    if (lstat(path, &info) == 0) {
+        fprintf(stderr, "HYF OOB output already exists; choose a new path: %s\n", path);
+        return -1;
+    }
+
+    if (errno != ENOENT) {
+        perror(path);
+        return -1;
+    }
+
+    return 0;
+}
+
+int hyf_nand_read_oob(const struct hyf_nand_read_options *options)
+{
+    struct sigaction old_interrupt, old_terminate;
+    bool interrupt_handler = false, terminate_handler = false;
+    bool output_created = false, config_touched = false;
+    unsigned char original_config = 0;
+    FILE *output = NULL;
+    int descriptor = -1, result = -1;
+    uint64_t bytes_written = 0;
+
+    stop_requested = 0;
+
+    if (options == NULL || options->oob_path == NULL || *options->oob_path == '\0' ||
+        options->address >= MAIN_CAPACITY || options->address % MAIN_PAGE != 0) {
+        fprintf(stderr, "HYF OOB read needs a new output and page-aligned main address.\n");
+        return -1;
+    }
+
+    uint64_t length = options->length;
+
+    if (length == 0) {
+        length = MAIN_CAPACITY - options->address;
+    }
+
+    /* Subtract before comparing: even UINT64_MAX cannot wrap the bound. */
+    if (length > MAIN_CAPACITY - options->address || length % MAIN_PAGE != 0 ||
+        require_new_output(options->oob_path) < 0) {
+        fprintf(stderr, "HYF OOB range/output invalid; range must be whole pages"
+                " within 256 MiB.\n");
+        return -1;
+    }
+
+    uint64_t expected_bytes = length / MAIN_PAGE * SPARE_PAGE;
+    uint32_t first_row = (uint32_t)(options->address / MAIN_PAGE);
+    uint32_t page_count = (uint32_t)(length / MAIN_PAGE);
+
+    printf("HYF raw OOB read: main range [0x%08" PRIx64 ",0x%08" PRIx64
+           "), %" PRIu32 " physical pages, %" PRIu64 " output bytes.\n",
+           options->address, options->address + length, page_count, expected_bytes);
+
+    if (options->dry_run) {
+        puts("DRY RUN: range/new output validated; no file created or SPI/USB calls made.");
+        return 0;
+    }
+
+    struct sigaction action;
+
+    memset(&action, 0, sizeof(action));
+    action.sa_handler = request_stop;
+    action.sa_flags = SA_RESTART;
+    sigemptyset(&action.sa_mask);
+
+    if (sigaction(SIGINT, &action, &old_interrupt) < 0) {
+        perror("sigaction SIGINT");
+        goto cleanup;
+    }
+
+    interrupt_handler = true;
+
+    if (sigaction(SIGTERM, &action, &old_terminate) < 0) {
+        perror("sigaction SIGTERM");
+        goto cleanup;
+    }
+
+    terminate_handler = true;
+
+    /* No truncation or following of an existing final-component symlink.
+     * Check/open output before sending commands, so path failures do not
+     * needlessly change the chip configuration.
+     */
+    descriptor = open(options->oob_path, O_WRONLY | O_CREAT | O_EXCL, 0666);
+
+    if (descriptor < 0) {
+        perror(options->oob_path);
+        goto cleanup;
+    }
+
+    output_created = true;
+    output = fdopen(descriptor, "wb");
+
+    if (output == NULL) {
+        perror("HYF OOB fdopen");
+        goto cleanup;
+    }
+
+    descriptor = -1; /* The FILE now owns this descriptor. */
+
+    /* A tiny, unbuffered stream makes the reported partial byte count the
+     * actual successful file-write count, even on an interrupted capture.
+     */
+    if (setvbuf(output, NULL, _IONBF, 0) != 0) {
+        fprintf(stderr, "Cannot configure HYF OOB output stream.\n");
+        goto cleanup;
+    }
+
+    const unsigned char identify[] = {0x9f, 0};
+    unsigned char id[2] = {0};
+
+    if (wait_read_ready() < 0 || stop_requested ||
+        transfer(identify, sizeof(identify), id, sizeof(id)) < 0) {
+        goto cleanup;
+    }
+
+    if (id[0] != 0xc9 || id[1] != 0x52) {
+        fprintf(stderr, "Expected HYF C9:52, observed %02x:%02x; no OOB captured.\n",
+                id[0], id[1]);
+        goto cleanup;
+    }
+
+    if (stop_requested || get_feature(FEATURE_CONFIG, &original_config) < 0) {
+        goto cleanup;
+    }
+
+    if ((original_config & CONFIG_OTP) != 0) {
+        fprintf(stderr, "HYF OTP mode enabled; refusing normal-array OOB capture.\n");
+        goto cleanup;
+    }
+
+    if (stop_requested) {
+        goto cleanup;
+    }
+
+    if ((original_config & CONFIG_ECC) != 0) {
+        /* Mark before sending: a failed transfer may still have changed B0. */
+        config_touched = true;
+
+        if (set_feature(FEATURE_CONFIG,
+                        original_config & (unsigned char)~CONFIG_ECC) < 0) {
+            goto cleanup;
+        }
+    }
+
+    for (uint32_t page = 0; page < page_count; page++) {
+        unsigned char spare[SPARE_PAGE];
+
+        if (read_spare_page(first_row + page, spare) < 0) {
+            goto cleanup;
+        }
+
+        size_t written = fwrite(spare, 1, sizeof(spare), output);
+
+        bytes_written += written;
+
+        if (written != sizeof(spare)) {
+            perror("HYF OOB output write");
+            goto cleanup;
+        }
+
+        if ((page + 1) % 4096 == 0) {
+            printf("OOB: %" PRIu32 "/%" PRIu32 " pages (%" PRIu64 " bytes).\n",
+                   page + 1, page_count, bytes_written);
+            fflush(stdout);
+        }
+    }
+
+    if (!stop_requested) {
+        result = 0;
+    }
+
+cleanup:
+    if (config_touched) {
+        unsigned char status = 0;
+
+        /* Read interruption must not suppress restoration. A pending page
+         * load is bounded by the ordinary ready timeout before changing B0.
+         * No WREN/WRDI or A0 command is part of this read-only path.
+         */
+        if (wait_ready(&status) < 0 ||
+            set_feature(FEATURE_CONFIG, original_config) < 0) {
+            fprintf(stderr, "Cannot restore original HYF B0; power-cycle before reuse.\n");
+            result = -1;
+        }
+    }
+
+    if (output != NULL) {
+        if (fflush(output) != 0) {
+            perror("HYF OOB output flush");
+            result = -1;
+        }
+
+        if (fclose(output) != 0) {
+            perror("HYF OOB output close");
+            result = -1;
+        }
+    }
+
+    if (descriptor >= 0 && close(descriptor) < 0) {
+        perror("HYF OOB descriptor close");
+        result = -1;
+    }
+
+    if (terminate_handler && sigaction(SIGTERM, &old_terminate, NULL) < 0) {
+        perror("restore SIGTERM");
+        result = -1;
+    }
+
+    if (interrupt_handler && sigaction(SIGINT, &old_interrupt, NULL) < 0) {
+        perror("restore SIGINT");
+        result = -1;
+    }
+
+    if (stop_requested) {
+        fprintf(stderr, "HYF OOB capture interrupted by signal %d.\n", (int)stop_requested);
+        result = -1;
+    }
+
+    if (output_created) {
+        printf("%s OOB capture retained: %" PRIu64 "/%" PRIu64 " bytes in %s.\n",
+               result == 0 ? "COMPLETE" : "PARTIAL/ERROR", bytes_written,
+               expected_bytes, options->oob_path);
     }
 
     return result;

@@ -92,10 +92,11 @@ void usage(void)
 		" --spi-clock HZ CH347 clock: 60000000 divided by a power of two (default 3750000)\n"
 		" --oob FILE     separate HYF2GQ4UAACAE OOB input, used with -w MAIN\n"
 		" --write-oob FILE  replace OOB while preserving live main data block by block\n"
-		" --oob-mode MODE   metadata (default, regenerate ECC) or raw (restore all OOB)\n"
-		" --dry-run      validate HYF files/range and print plan without opening USB\n"
-		" HYF modes use physical MAIN-area -a/-l addresses, aligned to 128 KiB blocks.\n"
-		" They erase/rewrite only that range. Flash read-back occurs only with -v.\n");
+		" --read-oob FILE   save raw OOB only to a NEW file; main bytes are not transferred\n"
+		" --oob-mode MODE   writes only: metadata (default, regenerate ECC) or raw\n"
+		" --dry-run      check HYF paths/range and print plan without opening USB\n"
+		" HYF -a/-l use physical MAIN-byte addresses: reads align to 2048-byte pages;\n"
+		" writes align to 128 KiB blocks. Post-write read-back occurs only with -v.\n");
 }
 
 /* Reject malformed/negative ranges before touching a programmer. The legacy
@@ -125,16 +126,20 @@ int main(int argc, char* argv[])
 	unsigned char *buf;
 	int long long len = 0, addr = 0, flen = 0, wlen = 0;
 	FILE *fp;
-	const char *programmer = "ch341a", *oob_file = NULL;
+	const char *programmer = "ch341a", *oob_file = NULL, *oob_output = NULL;
 	int oob_mode = -1; /* Unspecified: metadata, or raw if legacy -d was given. */
 	bool dry_run = false, clock_set = false;
 	unsigned int spi_clock = 0;
-	enum { OPT_OOB = 256, OPT_WRITE_OOB, OPT_OOB_MODE, OPT_DRY_RUN, OPT_SPI_CLOCK };
+	enum {
+		OPT_OOB = 256, OPT_WRITE_OOB, OPT_OOB_MODE, OPT_DRY_RUN,
+		OPT_SPI_CLOCK, OPT_READ_OOB
+	};
 	static const struct option long_options[] = {
 		{"programmer", required_argument, NULL, 'p'},
 		{"spi-clock", required_argument, NULL, OPT_SPI_CLOCK},
 		{"oob", required_argument, NULL, OPT_OOB},
 		{"write-oob", required_argument, NULL, OPT_WRITE_OOB},
+		{"read-oob", required_argument, NULL, OPT_READ_OOB},
 		{"oob-mode", required_argument, NULL, OPT_OOB_MODE},
 		{"dry-run", no_argument, NULL, OPT_DRY_RUN},
 		{"help", no_argument, NULL, 'h'},
@@ -177,6 +182,13 @@ int main(int argc, char* argv[])
 					else
 						op = 'O';
 				}
+				break;
+			case OPT_READ_OOB:
+				oob_output = optarg;
+				if (op)
+					op = 'x';
+				else
+					op = 'R';
 				break;
 			case OPT_OOB_MODE:
 				if (strcmp(optarg, "metadata") == 0)
@@ -325,6 +337,37 @@ int main(int argc, char* argv[])
 	}
 #endif
 
+	if (op == 'R') {
+		/* A capture is always raw and exactly physical: writer modes,
+		 * verification and bad-page skipping do not apply to this operation.
+		 */
+		if (oob_file || oob_mode >= 0 || vr || ECC_ignore || Skip_BAD_page || OOB_size) {
+			fprintf(stderr, "--read-oob saves raw OOB; do not combine it with write/ECC/verify options.\n");
+			return 2;
+		}
+#ifdef EEPROM_SUPPORT
+		if (eepromsize || mw_eepromsize || seepromsize || spage_size) {
+			fprintf(stderr, "HYF OOB reading cannot be combined with EEPROM options.\n");
+			return 2;
+		}
+#endif
+		struct hyf_nand_read_options options = {
+			.oob_path = oob_output,
+			.address = (uint64_t)addr,
+			.length = (uint64_t)len,
+			.dry_run = dry_run,
+		};
+
+		if (!dry_run && programmer_init() < 0)
+			return 1;
+
+		int result = hyf_nand_read_oob(&options);
+		if (!dry_run && programmer_shutdown() < 0)
+			result = -1;
+
+		return result == 0 ? 0 : 1;
+	}
+
 	if (oob_file) {
 		if ((op != 'w' && op != 'O') || ECC_ignore || Skip_BAD_page || OOB_size ||
 		    (oob_mode == 0 && !ECC_fcheck)) {
@@ -360,7 +403,7 @@ int main(int argc, char* argv[])
 	}
 
 	if (oob_mode >= 0 || dry_run) {
-		fprintf(stderr, "OOB mode/dry-run require --oob or --write-oob.\n");
+		fprintf(stderr, "OOB mode requires a write; dry-run requires --oob, --write-oob or --read-oob.\n");
 		return 2;
 	}
 
