@@ -1,0 +1,6 @@
+/src/*.o
+/src/*.d
+/src/SNANDer
+/src/.lusb_install
+/src/lusb_build/
+/build/

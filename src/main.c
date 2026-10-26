@@ -23,10 +23,14 @@
 #include <string.h>
 #include <getopt.h>
 #include <time.h>
+#include <errno.h>
+#include <limits.h>
 
 #include "flashcmd_api.h"
 #include "ch341a_spi.h"
 #include "spi_nand_flash.h"
+#include "programmer.h"
+#include "hyf_nand.h"
 
 struct flash_cmd prog;
 extern unsigned int bsize;
@@ -53,7 +57,7 @@ extern int org;
 #define EHELP	""
 #endif
 
-#define _VER	"1.7.9.3"
+#define _VER	"1.7.9.3+ch347-oob"
 
 void title(void)
 {
@@ -82,8 +86,36 @@ void usage(void)
 		" -w <filename>  write chip with data from filename\n"\
 		" -r <filename>  read chip and save data to filename\n"\
 		" -v             verify after write on chip\n";
-	printf(use);
-	exit(0);
+	printf("%s", use);
+	printf(
+		" -p <name>      SPI programmer: ch341a (default) or ch347\n"
+		" --spi-clock HZ CH347 clock: 60000000 divided by a power of two (default 3750000)\n"
+		" --oob FILE     separate HYF2GQ4UAACAE OOB input, used with -w MAIN\n"
+		" --write-oob FILE  replace OOB while preserving live main data block by block\n"
+		" --oob-mode MODE   metadata (default, regenerate ECC) or raw (restore all OOB)\n"
+		" --dry-run      validate HYF files/range and print plan without opening USB\n"
+		" HYF modes use physical MAIN-area -a/-l addresses, aligned to 128 KiB blocks.\n"
+		" They erase/rewrite only that range. Flash read-back occurs only with -v.\n");
+}
+
+/* Reject malformed/negative ranges before touching a programmer. The legacy
+ * path uses signed lengths, so values above LLONG_MAX are not representable.
+ */
+static int parse_range_number(const char *text, long long *value)
+{
+	char *end;
+	unsigned long long parsed;
+
+	if (!text[0] || text[0] == '-')
+		return -1;
+
+	errno = 0;
+	parsed = strtoull(text, &end, 0);
+	if (errno || *end || parsed > LLONG_MAX)
+		return -1;
+
+	*value = (long long)parsed;
+	return 0;
 }
 
 int main(int argc, char* argv[])
@@ -93,17 +125,72 @@ int main(int argc, char* argv[])
 	unsigned char *buf;
 	int long long len = 0, addr = 0, flen = 0, wlen = 0;
 	FILE *fp;
+	const char *programmer = "ch341a", *oob_file = NULL;
+	int oob_mode = -1; /* Unspecified: metadata, or raw if legacy -d was given. */
+	bool dry_run = false, clock_set = false;
+	unsigned int spi_clock = 0;
+	enum { OPT_OOB = 256, OPT_WRITE_OOB, OPT_OOB_MODE, OPT_DRY_RUN, OPT_SPI_CLOCK };
+	static const struct option long_options[] = {
+		{"programmer", required_argument, NULL, 'p'},
+		{"spi-clock", required_argument, NULL, OPT_SPI_CLOCK},
+		{"oob", required_argument, NULL, OPT_OOB},
+		{"write-oob", required_argument, NULL, OPT_WRITE_OOB},
+		{"oob-mode", required_argument, NULL, OPT_OOB_MODE},
+		{"dry-run", no_argument, NULL, OPT_DRY_RUN},
+		{"help", no_argument, NULL, 'h'},
+		{NULL, 0, NULL, 0}
+	};
 
 	title();
 
 #ifdef EEPROM_SUPPORT
-	while ((c = getopt(argc, argv, "diIhveLkl:a:w:r:o:s:E:f:8")) != -1)
+	while ((c = getopt_long(argc, argv, "diIhveLkp:l:a:w:r:o:s:E:f:8", long_options, NULL)) != -1)
 #else
-	while ((c = getopt(argc, argv, "diIhveLkl:a:w:r:o:s:")) != -1)
+	while ((c = getopt_long(argc, argv, "diIhveLkp:l:a:w:r:o:", long_options, NULL)) != -1)
 #endif
 	{
 		switch(c)
 		{
+			case 'p':
+				programmer = optarg;
+				break;
+			case OPT_SPI_CLOCK: {
+				long long value;
+				if (parse_range_number(optarg, &value) < 0 || value > UINT_MAX) {
+					fprintf(stderr, "Invalid SPI clock.\n");
+					return 2;
+				}
+				spi_clock = (unsigned int)value;
+				clock_set = true;
+				break;
+			}
+			case OPT_OOB:
+			case OPT_WRITE_OOB:
+				if (oob_file) {
+					fprintf(stderr, "Specify only one OOB input.\n");
+					return 2;
+				}
+				oob_file = optarg;
+				if (c == OPT_WRITE_OOB) {
+					if (op)
+						op = 'x';
+					else
+						op = 'O';
+				}
+				break;
+			case OPT_OOB_MODE:
+				if (strcmp(optarg, "metadata") == 0)
+					oob_mode = 0;
+				else if (strcmp(optarg, "raw") == 0)
+					oob_mode = 1;
+				else {
+					fprintf(stderr, "OOB mode must be metadata or raw.\n");
+					return 2;
+				}
+				break;
+			case OPT_DRY_RUN:
+				dry_run = true;
+				break;
 #ifdef EEPROM_SUPPORT
 			case 'E':
 				if ((eepromsize = parseEEPsize(optarg, &eeprom_info)) > 0) {
@@ -166,20 +253,26 @@ int main(int argc, char* argv[])
 				_ondie_ecc_flag = 0;
 				break;
 			case 'l':
-				str = strdup(optarg);
-				len = strtoll(str, NULL, *str && *(str + 1) == 'x' ? 16 : 10);
+				if (parse_range_number(optarg, &len) < 0) {
+					fprintf(stderr, "Invalid length.\n");
+					return 2;
+				}
 				break;
 			case 'o':
 				str = strdup(optarg);
 				OOB_size = strtoll(str, NULL, *str && *(str + 1) == 'x' ? 16 : 10);
 				break;
+#ifdef EEPROM_SUPPORT
 			case 's':
 				str = strdup(optarg);
 				spage_size = strtoll(str, NULL, *str && *(str + 1) == 'x' ? 16 : 10);
 				break;
+#endif
 			case 'a':
-				str = strdup(optarg);
-				addr = strtoll(str, NULL, *str && *(str + 1) == 'x' ? 16 : 10);
+				if (parse_range_number(optarg, &addr) < 0) {
+					fprintf(stderr, "Invalid address.\n");
+					return 2;
+				}
 				break;
 			case 'v':
 				vr = 1;
@@ -195,7 +288,7 @@ int main(int argc, char* argv[])
 			case 'w':
 				if(!op) {
 					op = c;
-					fname = strdup(optarg);
+					fname = optarg;
 				} else
 					op = 'x';
 				break;
@@ -203,19 +296,75 @@ int main(int argc, char* argv[])
 				support_flash_list();
 				exit(0);
 			case 'h':
+				usage();
+				return 0;
 			default:
 				usage();
+				return 2;
 		}
 	}
 
-	if (op == 0) usage();
+	if (op == 0 || optind != argc) {
+		usage();
+		return 2;
+	}
 
 	if (op == 'x' || (ECC_ignore && !ECC_fcheck) || (ECC_ignore && Skip_BAD_page) || (op == 'w' && ECC_ignore)) {
 		printf("Conflicting options, only one option at a time.\n\n");
 		return -1;
 	}
 
-	if (ch341a_spi_init() < 0) {
+	if (programmer_select(programmer) < 0 ||
+	    (clock_set && programmer_set_spi_clock(spi_clock) < 0))
+		return 2;
+
+#ifdef EEPROM_SUPPORT
+	if (!programmer_is_ch341a() && (eepromsize || mw_eepromsize)) {
+		fprintf(stderr, "CH347 support is SPI only; I2C/Microwire require CH341A.\n");
+		return 2;
+	}
+#endif
+
+	if (oob_file) {
+		if ((op != 'w' && op != 'O') || ECC_ignore || Skip_BAD_page || OOB_size ||
+		    (oob_mode == 0 && !ECC_fcheck)) {
+			fprintf(stderr, "Conflicting HYF OOB options. Use -w MAIN --oob OOB or --write-oob OOB.\n");
+			return 2;
+		}
+#ifdef EEPROM_SUPPORT
+		if (eepromsize || mw_eepromsize || seepromsize || spage_size) {
+			fprintf(stderr, "HYF OOB options cannot be combined with EEPROM options.\n");
+			return 2;
+		}
+#endif
+		struct hyf_nand_options options = {
+			.main_path = NULL,
+			.oob_path = oob_file,
+			.address = (uint64_t)addr,
+			.length = (uint64_t)len,
+			.raw = oob_mode == 1 || (oob_mode < 0 && !ECC_fcheck),
+			.verify = vr != 0,
+			.dry_run = dry_run,
+		};
+		if (op == 'w')
+			options.main_path = fname;
+
+		if (!dry_run && programmer_init() < 0)
+			return 1;
+
+		int result = hyf_nand_write(&options);
+		if (!dry_run && programmer_shutdown() < 0)
+			result = -1;
+
+		return result == 0 ? 0 : 1;
+	}
+
+	if (oob_mode >= 0 || dry_run) {
+		fprintf(stderr, "OOB mode/dry-run require --oob or --write-oob.\n");
+		return 2;
+	}
+
+	if (programmer_init() < 0) {
 		printf("Programmer device not found!\n\n");
 		return -1;
 	}
@@ -242,9 +391,9 @@ int main(int argc, char* argv[])
 		else
 			printf("Setting page size %dB for write.\n", spage_size);
 	}
-#else
-	if (op == 'i') goto out;
 #endif
+	if (op == 'i')
+		goto okout;
 	if (OOB_size) {
 		if (ECC_fcheck == 1) {
 			printf("Ignore option -o, use with -d only!\n");
@@ -315,6 +464,18 @@ int main(int argc, char* argv[])
 		}
 		if(len == flen)
 			len = wlen;
+		else if (wlen != len) {
+			fprintf(stderr, "Input is shorter than the requested write; no write performed.\n");
+			fclose(fp);
+			free(buf);
+			goto out;
+		}
+		if (len <= 0) {
+			fprintf(stderr, "Refusing an empty write.\n");
+			fclose(fp);
+			free(buf);
+			goto out;
+		}
 		printf("Write addr = 0x%016llX, len = 0x%016llX\n", addr, len);
 		ret = prog.flash_write(buf, addr, len);
 		if(ret > 0) {
@@ -330,6 +491,12 @@ int main(int argc, char* argv[])
 			printf("Status: BAD(%d)\n", ret);
 		fclose(fp);
 		free(buf);
+		/* Upstream fell through to the error exit after a successful write
+		 * without -v. Skipping optional verification is still success.
+		 */
+		if (ret > 0)
+			goto okout;
+		goto out;
 	}
 
 very:
@@ -344,16 +511,26 @@ very:
 			goto out;
 		}
 		if (svr) {
-			unsigned char ch1;
-			int i = 0;
+			unsigned char expected[4096];
+			bool equal = fseeko(fp, 0, SEEK_SET) == 0;
+			long long offset = 0;
 
-			fseek(fp, 0, SEEK_SET);
-			ch1 = (unsigned char)getc(fp);
+			/* Compare every requested byte, including FF and the last byte.
+			 * The old unsigned-char/getc loop could misreport a mismatch as
+			 * success after advancing its index. Verification remains opt-in.
+			 */
+			while (equal && offset < len) {
+				size_t count = sizeof(expected);
+				if ((unsigned long long)(len - offset) < count)
+					count = (size_t)(len - offset);
+				if (fread(expected, 1, count, fp) != count ||
+				    memcmp(expected, buf + offset, count) != 0)
+					equal = false;
+				else
+					offset += count;
+			}
 
-			while ((ch1 != EOF) && (i < len - 1) && (ch1 == buf[i++]))
-				ch1 = (unsigned char)getc(fp);
-
-			if (ch1 == buf[i]){
+			if (equal) {
 				printf("Status: OK\n");
 				fclose(fp);
 				free(buf);
@@ -385,9 +562,10 @@ very:
 	}
 
 out:	//exit with errors
-	ch341a_spi_shutdown();
+	programmer_shutdown();
 	return -1;
 okout:	//exit without errors
-	ch341a_spi_shutdown();
+	if (programmer_shutdown() < 0)
+		return -1;
 	return 0;
 }
