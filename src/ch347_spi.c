@@ -14,20 +14,25 @@
  * GET_CFG is CA/01/00/01, config payload is 26 bytes, and INIT/OUT status
  * byte zero means success. No proprietary vendor library is linked.
  *
- * Optional DMA/automatic-CS C2 transport is adapted from WCH's GPL-2.0+
+ * Optional DMA C2 transport is adapted from WCH's GPL-2.0+
  * driver, Copyright (C) 2026 Nanjing Qinheng Microelectronics Co., Ltd.:
  * https://github.com/WCHSoftGroup/ch34x_mphsi_master_linux/tree/57be7ed01e2adb14d34bcca5e1eb71ff6247aba7
- * ch34x_mphsi_master_spi.c: ch347_spi_native_dma (medium mode);
+ * ch34x_mphsi_master_spi.c: ch347_spi_native_dma (medium mode), plus
+ * ch347_spi_native and ch347_spi_transfer_one_message for manual C1/C2 CS;
  * ch34x_mphsi_master_usb.c: ch347_get_chipinfo;
  * ch34x_mphsi.h: 4093-byte C2 payload limit. E1 is clock control and
  * E2 is CH347F function switching; neither enables DMA here.
  */
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#endif
 #include "ch347_spi.h"
 
 #include <libusb-1.0/libusb.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 
 enum {
     CH347_VENDOR_ID = 0x1a86,
@@ -77,6 +82,9 @@ static struct {
 
 static unsigned int clock_divisor = CH347_DEFAULT_DIVISOR;
 static bool dma_mode;
+
+static int dma_transfer(unsigned int writecnt, unsigned int readcnt,
+    const unsigned char *writearr, unsigned char *readarr, bool automatic_cs);
 
 static void put_le16(uint8_t *bytes, unsigned int value)
 {
@@ -469,6 +477,15 @@ int ch347_spi_send_command(unsigned int writecnt, unsigned int readcnt,
         return fail_session();
     }
 
+    if (dma_mode) {
+        /* Keep the caller's C1 CS edges, including empty transactions. WCH's
+         * normal duplex path and DMA continuation frames both use C2 without
+         * automatic-CS bits. Each fragment completes before returning, so
+         * status reads and program/erase command ordering remain unchanged.
+         */
+        return dma_transfer(writecnt, readcnt, writearr, readarr, false);
+    }
+
     while (writecnt != 0) {
         unsigned int length = writecnt;
 
@@ -521,20 +538,50 @@ int ch347_spi_send_command(unsigned int writecnt, unsigned int readcnt,
     return 0;
 }
 
+static int monotonic_milliseconds(uint64_t *milliseconds)
+{
+    struct timespec now;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+        fprintf(stderr, "Cannot read the CH347 DMA reply deadline clock.\n");
+        return -1;
+    }
+
+    *milliseconds = (uint64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
+    return 0;
+}
+
 /* WCH's bulk helper accumulates IN fragments of one DMA reply until the
  * requested total is present. A short USB completion is not another C2
  * frame: do not issue SPI again or expect an extra header in the middle.
+ * All fragments share one deadline; progress cannot restart the timeout.
  */
 static int read_dma_reply(uint8_t *packet, unsigned int payload_bytes)
 {
     unsigned int received = 0;
     unsigned int expected = CH347_HEADER_BYTES + payload_bytes;
+    uint64_t now;
+
+    if (monotonic_milliseconds(&now) != 0) {
+        return -1;
+    }
+
+    uint64_t deadline = now + CH347_USB_TIMEOUT_MS;
 
     while (received < expected) {
+        if (monotonic_milliseconds(&now) != 0) {
+            return -1;
+        }
+
+        if (now >= deadline) {
+            fprintf(stderr, "CH347 DMA reply deadline expired.\n");
+            return -1;
+        }
+
         int transferred = 0;
         int result = libusb_bulk_transfer(device.handle, CH347_READ_EP,
             packet + received, (int)(expected - received), &transferred,
-            CH347_USB_TIMEOUT_MS);
+            (unsigned int)(deadline - now));
 
         if (result != 0 || transferred <= 0 ||
             transferred > (int)(expected - received)) {
@@ -560,52 +607,51 @@ static int read_dma_reply(uint8_t *packet, unsigned int payload_bytes)
     return 0;
 }
 
-static int dma_transaction(unsigned int writecnt, unsigned int readcnt,
-    const unsigned char *writearr, unsigned char *readarr)
+static int dma_transfer(unsigned int writecnt, unsigned int readcnt,
+    const unsigned char *writearr, unsigned char *readarr, bool automatic_cs)
 {
     uint8_t output[CH347_DMA_PACKET_BYTES];
     uint8_t input[CH347_DMA_PACKET_BYTES];
+    bool first = true;
 
-    /* Match WCH's bounded medium-mode transfer domain. Check subtraction
-     * before forming the sum, including on hosts with 32-bit unsigned int.
+    /* The complete-transaction API matches WCH's medium-mode transfer limit.
+     * Legacy callers may stream larger fragments under their own C1 edges;
+     * decrement separate counts instead of adding them and risking overflow.
      */
-    if (readcnt > CH347_DMA_MAX_TRANSFER ||
-        writecnt > CH347_DMA_MAX_TRANSFER - readcnt) {
+    if (automatic_cs && (readcnt > CH347_DMA_MAX_TRANSFER ||
+        writecnt > CH347_DMA_MAX_TRANSFER - readcnt)) {
         fprintf(stderr, "CH347 DMA transaction exceeds %u SPI bytes.\n",
             (unsigned int)CH347_DMA_MAX_TRANSFER);
         return fail_session();
     }
 
-    unsigned int total = writecnt + readcnt;
+    while (writecnt != 0 || readcnt != 0) {
+        unsigned int prefix = writecnt;
 
-    for (unsigned int offset = 0; offset < total;) {
-        unsigned int length = total - offset;
-
-        if (length > CH347_DMA_DATA_BYTES) {
-            length = CH347_DMA_DATA_BYTES;
+        if (prefix > CH347_DMA_DATA_BYTES) {
+            prefix = CH347_DMA_DATA_BYTES;
         }
 
+        unsigned int reads = readcnt;
+
+        if (reads > CH347_DMA_DATA_BYTES - prefix) {
+            reads = CH347_DMA_DATA_BYTES - prefix;
+        }
+
+        unsigned int length = prefix + reads;
         output[0] = CH347_CMD_DUPLEX;
         put_le16(output + 1, length);
 
-        if (offset == 0) {
+        if (automatic_cs && first) {
             output[2] |= 0x80; /* CS0 active on the first frame only. */
         }
 
-        if (offset + length == total) {
+        if (automatic_cs && prefix == writecnt && reads == readcnt) {
             output[2] |= 0x40; /* CS0 inactive after the final frame. */
         }
 
-        unsigned int prefix = 0;
-
-        if (offset < writecnt) {
-            prefix = writecnt - offset;
-
-            if (prefix > length) {
-                prefix = length;
-            }
-
-            memcpy(output + CH347_HEADER_BYTES, writearr + offset, prefix);
+        if (prefix != 0) {
+            memcpy(output + CH347_HEADER_BYTES, writearr, prefix);
         }
 
         /* Match configure_spi's zero default MOSI byte during reads. Full
@@ -620,15 +666,24 @@ static int dma_transaction(unsigned int writecnt, unsigned int readcnt,
             return fail_session();
         }
 
-        if (length > prefix) {
-            memcpy(readarr + (offset + prefix - writecnt),
-                input + CH347_HEADER_BYTES + prefix, length - prefix);
+        if (prefix != 0) {
+            writearr += prefix;
         }
 
-        offset += length;
+        if (reads != 0) {
+            memcpy(readarr, input + CH347_HEADER_BYTES + prefix, reads);
+            readarr += reads;
+        }
+
+        writecnt -= prefix;
+        readcnt -= reads;
+        first = false;
     }
 
-    device.selected = false;
+    if (automatic_cs) {
+        device.selected = false;
+    }
+
     return 0;
 }
 
@@ -650,7 +705,7 @@ int ch347_spi_transaction(unsigned int writecnt, unsigned int readcnt,
     }
 
     if (dma_mode) {
-        return dma_transaction(writecnt, readcnt, writearr, readarr);
+        return dma_transfer(writecnt, readcnt, writearr, readarr, true);
     }
 
     if (ch347_spi_select_chip(true) != 0) {

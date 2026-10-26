@@ -90,7 +90,7 @@ void usage(void)
 	printf(
 		" -p <name>      SPI programmer: ch341a (default) or ch347\n"
 		" --spi-clock HZ CH347 clock: 60000000 divided by a power of two (default 3750000)\n"
-		" --ch347-mode MODE  normal (default) or dma; DMA supports separate HYF main/OOB modes\n"
+		" --ch347-mode MODE  CH347 SPI transport: normal (default) or dma\n"
 		" --programmer-info  report CH347 adapter/firmware, without issuing NAND commands\n"
 		" --oob FILE     HYF OOB file: -w MAIN restores both; -r MAIN captures both raw\n"
 		" --write-oob FILE  replace OOB while preserving live main data block by block\n"
@@ -368,13 +368,6 @@ int main(int argc, char* argv[])
 		if (programmer_init() < 0)
 			return 1;
 		return programmer_shutdown() == 0 ? 0 : 1;
-	}
-
-	if (spi_mode && strcmp(spi_mode, "dma") == 0 &&
-	    op != 'R' && !(op == 'r' && oob_file) &&
-	    !(oob_file && (op == 'w' || op == 'O'))) {
-		fprintf(stderr, "DMA requires HYF -r MAIN --oob OOB, --read-oob, -w MAIN --oob OOB or --write-oob.\n");
-		return 2;
 	}
 
 	if (op == 'R' || (op == 'r' && oob_file)) {

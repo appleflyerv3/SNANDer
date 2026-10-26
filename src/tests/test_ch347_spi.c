@@ -10,13 +10,18 @@
  * These tests verify this backend's wire contract, not hardware compatibility,
  * SPI signal integrity, flash behavior or firmware-revision compatibility.
  */
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#endif
 #include "ch347_spi.h"
 
 #include <libusb-1.0/libusb.h>
+#include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #define CHECK(condition) do { \
     if (!(condition)) { \
@@ -66,6 +71,9 @@ static struct {
     int claim_result;
     uint16_t firmware;
     uint16_t usb_revision;
+    uint64_t monotonic_ms;
+    unsigned int clock_step_ms;
+    unsigned int last_read_timeout;
 } fake;
 
 static struct event *queue_event(unsigned char endpoint, int length,
@@ -273,12 +281,22 @@ const char *LIBUSB_CALL libusb_error_name(int error)
     return "scripted USB result";
 }
 
+/* No real clock or waiting: exercise reply deadlines deterministically. */
+int clock_gettime(clockid_t clock, struct timespec *now)
+{
+    CHECK(clock == CLOCK_MONOTONIC);
+    now->tv_sec = (time_t)(fake.monotonic_ms / 1000);
+    now->tv_nsec = (long)(fake.monotonic_ms % 1000) * 1000000;
+    fake.monotonic_ms += fake.clock_step_ms;
+    return 0;
+}
+
 int LIBUSB_CALL libusb_bulk_transfer(libusb_device_handle *input,
     unsigned char endpoint, unsigned char *data, int length,
     int *transferred, unsigned int timeout)
 {
     CHECK(input == &handle);
-    CHECK(timeout == 10000);
+    CHECK(timeout != 0 && timeout <= 10000);
     CHECK(fake.next < fake.count);
     const struct event *event = &fake.events[fake.next++];
     CHECK(endpoint == event->endpoint);
@@ -287,6 +305,7 @@ int LIBUSB_CALL libusb_bulk_transfer(libusb_device_handle *input,
         CHECK(memcmp(data, event->bytes, (size_t)length) == 0);
     } else {
         CHECK(endpoint == 0x86);
+        fake.last_read_timeout = timeout;
         CHECK(event->transferred <= length);
         memcpy(data, event->bytes, (size_t)event->transferred);
     }
@@ -429,6 +448,242 @@ static void expect_dma_frame(const unsigned char *output,
     reply->bytes[2] = (length >> 8) | cs_flags;
     if (input != NULL) {
         memcpy(reply->bytes + 3, input, length);
+    }
+}
+
+static void test_dma_fragmented_page(void)
+{
+    const unsigned char cache[] = {0x03, 0, 0, 0xff};
+    const unsigned char program[] = {0x02, 0, 0};
+    unsigned char clocks[2176] = {0};
+    unsigned char data[2176], output[2176];
+    for (unsigned int index = 0; index < sizeof(data); index++) {
+        data[index] = (index ^ (index >> 8) ^ 0xa5) & 0xff;
+    }
+    reset_fixture(false, 1);
+    CHECK(ch347_spi_set_mode("dma") == 0);
+    expect_initialization(4 << 3);
+    expect_cs(true);
+    /* Legacy SPI_CONTROLLER sends opcode/address/dummy bytes separately. */
+    for (unsigned int index = 0; index < sizeof(cache); index++) {
+        expect_dma_frame(cache + index, NULL, 1, 0);
+    }
+    expect_dma_frame(clocks, data, sizeof(data), 0);
+    expect_cs(false);
+    expect_cs(true);
+    for (unsigned int index = 0; index < sizeof(program); index++) {
+        expect_dma_frame(program + index, NULL, 1, 0);
+    }
+    expect_dma_frame(data, NULL, sizeof(data), 0);
+    expect_cs(false);
+    expect_cs(false);
+    CHECK(ch347_spi_init() == 0);
+    CHECK(ch347_spi_select_chip(true) == 0);
+    for (unsigned int index = 0; index < sizeof(cache); index++) {
+        CHECK(ch347_spi_send_command(1, 0, cache + index, NULL) == 0);
+    }
+    CHECK(ch347_spi_send_command(0, sizeof(output), NULL, output) == 0);
+    CHECK(memcmp(output, data, sizeof(data)) == 0);
+    CHECK(ch347_spi_select_chip(false) == 0);
+    CHECK(ch347_spi_select_chip(true) == 0);
+    for (unsigned int index = 0; index < sizeof(program); index++) {
+        CHECK(ch347_spi_send_command(1, 0, program + index, NULL) == 0);
+    }
+    /* 2179 SPI bytes in the program-load CS window, including main+OOB. */
+    CHECK(ch347_spi_send_command(sizeof(data), 0, data, NULL) == 0);
+    CHECK(ch347_spi_select_chip(false) == 0);
+    CHECK(ch347_spi_shutdown() == 0);
+    check_finished(true);
+    CHECK(ch347_spi_set_mode("normal") == 0);
+}
+
+static void test_dma_fragmented_boundary(void)
+{
+    unsigned char command[4094];
+    unsigned char middle_clocks[4093] = {0};
+    unsigned char middle_reply[4093];
+    const unsigned char tail_clocks[4] = {0};
+    const unsigned char tail_reply[] = {0x11, 0x22, 0x33, 0x44};
+    const unsigned char following = 0x7b;
+    unsigned char output[4096];
+    memset(command, 0x6a, sizeof(command));
+    command[4093] = 0x93;
+    middle_clocks[0] = command[4093];
+    for (unsigned int index = 0; index < sizeof(middle_reply); index++) {
+        middle_reply[index] = (index ^ 0xa5) & 0xff;
+    }
+    reset_fixture(false, 0);
+    CHECK(ch347_spi_set_mode("dma") == 0);
+    expect_initialization(4 << 3);
+    expect_cs(true);
+    expect_dma_frame(command, NULL, 4093, 0);
+    expect_dma_frame(middle_clocks, middle_reply, 4093, 0);
+    expect_dma_frame(tail_clocks, tail_reply, 4, 0);
+    expect_dma_frame(&following, NULL, 1, 0);
+    expect_cs(false);
+    expect_cs(false);
+    CHECK(ch347_spi_init() == 0);
+    CHECK(ch347_spi_select_chip(true) == 0);
+    CHECK(ch347_spi_send_command(sizeof(command), sizeof(output),
+        command, output) == 0);
+    CHECK(memcmp(output, middle_reply + 1, 4092) == 0);
+    CHECK(memcmp(output + 4092, tail_reply, sizeof(tail_reply)) == 0);
+    /* A successful read does not release caller-owned CS. */
+    CHECK(ch347_spi_send_command(1, 0, &following, NULL) == 0);
+    CHECK(ch347_spi_select_chip(false) == 0);
+    CHECK(ch347_spi_shutdown() == 0);
+    check_finished(false);
+    CHECK(ch347_spi_set_mode("normal") == 0);
+}
+
+static void test_dma_large_fragment(bool reading)
+{
+    unsigned char data[65536], output[65536];
+    unsigned char clocks[DMA_PAYLOAD_BYTES] = {0};
+    for (unsigned int index = 0; index < sizeof(data); index++) {
+        data[index] = (index ^ (index >> 8)) & 0xff;
+    }
+    reset_fixture(false, 0);
+    CHECK(ch347_spi_set_mode("dma") == 0);
+    expect_initialization(4 << 3);
+    expect_cs(true);
+    for (unsigned int offset = 0; offset < sizeof(data);) {
+        unsigned int length = sizeof(data) - offset;
+        if (length > DMA_PAYLOAD_BYTES) {
+            length = DMA_PAYLOAD_BYTES;
+        }
+        expect_dma_frame(reading ? clocks : data + offset,
+            reading ? data + offset : NULL, length, 0);
+        offset += length;
+    }
+    expect_cs(false);
+    expect_cs(false);
+    CHECK(ch347_spi_init() == 0);
+    CHECK(ch347_spi_select_chip(true) == 0);
+    CHECK(ch347_spi_send_command(reading ? 0 : sizeof(data),
+        reading ? sizeof(output) : 0, reading ? NULL : data,
+        reading ? output : NULL) == 0);
+    if (reading) {
+        CHECK(memcmp(output, data, sizeof(data)) == 0);
+    }
+    CHECK(ch347_spi_select_chip(false) == 0);
+    CHECK(ch347_spi_shutdown() == 0);
+    check_finished(false);
+    CHECK(ch347_spi_set_mode("normal") == 0);
+}
+
+static void test_dma_empty_cs(void)
+{
+    reset_fixture(false, 0);
+    CHECK(ch347_spi_set_mode("dma") == 0);
+    expect_initialization(4 << 3);
+    expect_cs(true);
+    expect_cs(false);
+    expect_cs(false);
+    CHECK(ch347_spi_init() == 0);
+    CHECK(ch347_spi_transaction(0, 0, NULL, NULL) == 0);
+    CHECK(ch347_spi_select_chip(true) == 0);
+    CHECK(ch347_spi_send_command(0, 0, NULL, NULL) == 0);
+    CHECK(ch347_spi_select_chip(false) == 0);
+    CHECK(ch347_spi_shutdown() == 0);
+    check_finished(false);
+    CHECK(ch347_spi_set_mode("normal") == 0);
+}
+
+static void test_dma_fragmented_fault(unsigned int fault)
+{
+    const unsigned char prefix = 0x03;
+    const unsigned char clocks[2] = {0};
+    const unsigned char reply[] = {0xc9, 0x52};
+    unsigned char output[] = {0x11, 0x22};
+    reset_fixture(false, 1);
+    CHECK(ch347_spi_set_mode("dma") == 0);
+    expect_initialization(4 << 3);
+    expect_cs(true);
+    expect_dma_frame(&prefix, NULL, 1, 0);
+    expect_dma_frame(clocks, reply, 2, 0);
+    struct event *response = &fake.events[fake.count - 1];
+    if (fault == 0) {
+        response->bytes[0] = 0xc3;
+    } else if (fault == 1) {
+        response->bytes[1] = 1;
+    } else if (fault == 2) {
+        response->result = LIBUSB_ERROR_TIMEOUT;
+        response->transferred = 4;
+    } else if (fault == 3) {
+        response->transferred = 0;
+    } else {
+        fake.count--; /* no IN follows a short OUT */
+        fake.events[fake.count - 1].transferred--;
+    }
+    expect_cs(false); /* failure handler */
+    expect_cs(false); /* explicit legacy deselect remains best effort */
+    expect_cs(false); /* shutdown */
+    CHECK(ch347_spi_init() == 0);
+    CHECK(ch347_spi_select_chip(true) == 0);
+    CHECK(ch347_spi_send_command(1, 0, &prefix, NULL) == 0);
+    CHECK(ch347_spi_send_command(0, sizeof(output), NULL, output) == -1);
+    CHECK(output[0] == 0x11 && output[1] == 0x22);
+    unsigned int consumed = fake.next;
+    CHECK(ch347_spi_send_command(1, 0, &prefix, NULL) == -1);
+    CHECK(ch347_spi_send_command(0, 0, NULL, NULL) == -1);
+    CHECK(ch347_spi_select_chip(true) == -1);
+    CHECK(ch347_spi_transaction(1, 0, &prefix, NULL) == -1);
+    CHECK(fake.next == consumed);
+    CHECK(ch347_spi_select_chip(false) == -1);
+    CHECK(ch347_spi_shutdown() == -1);
+    check_finished(true);
+    CHECK(ch347_spi_set_mode("normal") == 0);
+}
+
+static void test_dma_reply_deadline(void)
+{
+    const unsigned char command[] = {0x9f, 0};
+    const unsigned char clocks[] = {0x9f, 0, 0, 0};
+    const unsigned char reply[] = {0xaa, 0xbb, 0xc9, 0x52};
+    unsigned char output[] = {0x11, 0x22};
+    reset_fixture(false, 0);
+    CHECK(ch347_spi_set_mode("dma") == 0);
+    expect_initialization(4 << 3);
+    expect_dma_frame(clocks, reply, 4, 0xc0);
+    unsigned char full_reply[7];
+    memcpy(full_reply, fake.events[fake.count - 1].bytes, sizeof(full_reply));
+    fake.events[fake.count - 1].transferred = 2;
+    struct event *rest = queue_event(0x86, 5, 0, 1);
+    memcpy(rest->bytes, full_reply + 2, 1);
+    expect_cs(false);
+    expect_cs(false);
+    CHECK(ch347_spi_init() == 0);
+    fake.clock_step_ms = 4000;
+    CHECK(ch347_spi_transaction(2, 2, command, output) == -1);
+    CHECK(fake.last_read_timeout == 2000);
+    CHECK(output[0] == 0x11 && output[1] == 0x22);
+    CHECK(ch347_spi_shutdown() == -1);
+    check_finished(false);
+    CHECK(ch347_spi_set_mode("normal") == 0);
+}
+
+static void test_dma_complete_limit(void)
+{
+    const unsigned int counts[][2] = {
+        {65489, 0}, {UINT_MAX, 1}, {1, UINT_MAX},
+    };
+    for (unsigned int index = 0;
+         index < sizeof(counts) / sizeof(counts[0]); index++) {
+        const unsigned char command = 0x9f;
+        unsigned char output = 0x5a;
+        reset_fixture(false, 0);
+        CHECK(ch347_spi_set_mode("dma") == 0);
+        expect_initialization(4 << 3);
+        expect_cs(false); /* rejected before touching the small buffers */
+        expect_cs(false);
+        CHECK(ch347_spi_init() == 0);
+        CHECK(ch347_spi_transaction(counts[index][0], counts[index][1],
+            &command, &output) == -1);
+        CHECK(output == 0x5a);
+        CHECK(ch347_spi_shutdown() == -1);
+        check_finished(false);
+        CHECK(ch347_spi_set_mode("normal") == 0);
     }
 }
 
@@ -644,6 +899,16 @@ int main(void)
     test_no_device_cleanup();
     test_normal_complete_transaction();
     test_dma_page();
+    test_dma_fragmented_page();
+    test_dma_fragmented_boundary();
+    test_dma_large_fragment(false);
+    test_dma_large_fragment(true);
+    test_dma_empty_cs();
+    for (unsigned int fault = 0; fault < 5; fault++) {
+        test_dma_fragmented_fault(fault);
+    }
+    test_dma_reply_deadline();
+    test_dma_complete_limit();
     test_dma_chunk_boundary();
     test_dma_split_usb_reply();
     for (unsigned int fault = 0; fault < 5; fault++) {

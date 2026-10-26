@@ -29,9 +29,9 @@ of every adapter/wiring setup or of the write paths.
 
 `--ch347-mode normal` is the default and keeps the existing manual-CS,
 507-byte USB framing. `--ch347-mode dma` opts into WCH's C2 full-duplex
-automatic-CS protocol, using up to 4093 SPI bytes per USB command. A full
-HYF cache read or program-load fits in one such command. Distinct NAND
-commands remain distinct transactions; page-load/ready checks are not skipped.
+protocol, using up to 4093 SPI bytes per USB command. A full HYF cache read
+or program-load fits in one such command. Distinct NAND commands remain
+distinct transactions; page-load/ready checks are not skipped.
 No proprietary WCH library or kernel-driver installation is required.
 
 The DMA protocol requires **CH347T firmware 0x0341 or newer**, following
@@ -45,18 +45,59 @@ sudo ./src/SNANDer -p ch347 --programmer-info
 ```
 
 This configures the adapter's SPI interface and leaves CS inactive; it does
-not probe/unlock the NAND like the inherited `-i` operation. DMA is supported
-only by the separate-file HYF operations: `-r MAIN --oob OOB`, `--read-oob`,
-`-w MAIN --oob OOB` and `--write-oob`. Legacy plain `-r`/`-w`, erase-only,
-EEPROM and `-i` reject a DMA request instead of silently ignoring it.
-Existing ready-status/ID checks must succeed before ECC/protection changes
-or writing. If DMA is unsupported or a capture fails, use normal mode with
-new output names; failed captures are never automatically replayed.
+not probe/unlock the NAND like the inherited `-i` operation. DMA now supports
+both the separate-file HYF operations and the inherited SPI controller path,
+including plain `-r MAIN`, `-w MAIN`, SPI chip identification and erase.
+SPI EEPROM traffic also uses that controller; I2C/Microwire remain CH341A-only.
+This is a transport option, not a change to the selected flash operation.
+
+The complete HYF transaction API uses C2 automatic CS assertion/release.
+The legacy controller instead retains its explicit C1 CS edges, sending each
+opcode/address/data fragment through C2 with no automatic CS flags. This
+preserves CS across fragments, including separate write/read calls, without
+buffering a whole transaction or changing when bytes are sent. Large
+fragments are streamed in bounded 4093-byte chunks. Small fragments still
+have their individual USB overhead, so this bridge need not achieve the same
+speed as the complete HYF transaction API. Existing normal-mode framing is
+unchanged.
+
+Each flash driver's existing identification/status checks and ECC/protection
+behavior are unchanged. If DMA is unsupported or a capture fails, use normal
+mode with new output names; failed captures are never automatically replayed.
 
 DMA reduces transport overhead for both HYF reads **and writes**, including
 program-load commands and OOB-only preservation reads. It does not reduce
 the NAND's internal erase/program time. Read-back verification still occurs
 only with `-v`; required command acknowledgements/status checks remain.
+
+### Main-only DMA operations
+
+Plain main-only reads keep the original reader and its progress display/ECC
+behavior; adding DMA changes only the CH347 USB transport. For an 8-MiB
+read-only comparison, use new output names and record shell `time` output:
+
+```sh
+sudo -v
+time sudo ./src/SNANDer -p ch347 --spi-clock 60000000 \
+  --ch347-mode normal -a 0 -l 0x800000 -r perf_main_normal.bin
+time sudo ./src/SNANDer -p ch347 --spi-clock 60000000 \
+  --ch347-mode dma -a 0 -l 0x800000 -r perf_main_dma.bin
+cmp perf_main_normal.bin perf_main_dma.bin
+```
+
+`sudo -v` authenticates before timing, so password entry is not included.
+Unlike the separate-OOB reader, the inherited main-only reader overwrites an
+existing output file. Choose unused names. Compare these two ECC-enabled
+captures to each other, not necessarily to the earlier ECC-disabled raw pair.
+The 2.87x speedup below measured the complete HYF API, not this legacy bridge.
+
+Main-only `-w MAIN` also accepts DMA, with its existing limitations unchanged:
+the legacy NAND writer does **not** erase automatically and skips all-`FF`
+input pages. It attempts to carry forward cached OOB, but is not a complete
+erase-and-restore procedure for an already programmed dictionary. For an
+exact raw restoration use `-w MAIN --oob OOB --oob-mode raw` with a matching
+pair, which uses the block erase/rewrite writer. Adding DMA does not change
+which blocks are erased or introduce automatic verification.
 
 Use voltage-compatible SPI wiring and a common ground. This software does
 not set adapter supply/IO voltage. Do not use 5 V signals for this NAND or
@@ -328,3 +369,7 @@ mapping (full-chip files and slices), optional verification, ECC-mode handling
 and failure cleanup, plus raw OOB-only and paired reads with fake programmer calls.
 NAND fixtures use only a few blocks of actual disk/RAM;
 full-chip input mapping is tested with sparse files, not a full-chip buffer.
+Legacy DMA checks also cover caller-owned CS across separate opcode/address/
+data fragments, full-page program loads, fragments larger than 64 KiB and
+the shared monotonic deadline for split USB replies. No hardware write is
+performed by these checks.
