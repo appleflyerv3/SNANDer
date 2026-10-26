@@ -20,8 +20,10 @@ and CH347F (`1a86:55de`, interface 4). It is not a HID/JTAG/UART backend.
 I2C and Microwire remain CH341A-only. SPI uses mode 0, MSB first,
 active-low CS0 and a default 3.75 MHz clock. `--spi-clock HZ` accepts exactly
 60000000, 30000000, 15000000, 7500000, 3750000, 1875000, 937500 or 468750.
-Only single-lane SPI is implemented; speed and hardware compatibility have
-not yet been measured on a physical CH347.
+Only single-lane SPI is implemented. User-reported CH347T main-data captures
+at 30 and 60 MHz produced identical SHA-256 hashes, taking 258 and 220 seconds
+respectively **before the batching changes below**. This is not validation
+of every adapter/wiring setup or of the write paths.
 
 Use voltage-compatible SPI wiring and a common ground. This software does
 not set adapter supply/IO voltage. Do not use 5 V signals for this NAND or
@@ -50,12 +52,13 @@ slice. For a full-chip input, the writer seeks to the corresponding physical
 offset. For a slice it starts at byte zero. Main and OOB are mapped independently.
 OOB slice size is main range length divided by 16.
 
-The provided `hyf2gq4_dump.bin` and `hyf2gq4_oob.bin` have the required full-chip
-sizes. From `/home/appleflyer/dict`, a **non-writing** plan is:
+The provided original `hyf2gq4_dump.bin` and `hyf2gq4_oob.bin` captures are in
+`dumps/original` in this workspace. From `/home/appleflyer/dict`, a
+**non-writing** restoration plan is:
 
 ```sh
-./SNANDer/src/SNANDer -p ch347 -w hyf2gq4_dump.bin \
-  --oob hyf2gq4_oob.bin --oob-mode raw --dry-run
+./SNANDer/src/SNANDer -p ch347 -w dumps/original/hyf2gq4_dump.bin \
+  --oob dumps/original/hyf2gq4_oob.bin --oob-mode raw --dry-run
 ```
 
 `--dry-run` checks file types/sizes and range alignment. It does not open USB,
@@ -97,6 +100,46 @@ On interruption/read/output failure, the command returns an error and keeps
 the partial file, reporting how many output bytes were written. Do not treat
 a failed capture as a complete dump.
 
+### Capture main and OOB together, in one pass
+
+Use `-r MAIN --oob OOB` to save a matching **raw** pair. Both files must be new:
+
+```sh
+cd /home/appleflyer/dict/dumps/bkp1
+sudo ../../SNANDer/src/SNANDer -p ch347 --spi-clock 60000000 \
+  -r hyf2gq4_main_raw_fast.bin --oob hyf2gq4_oob_raw_fast.bin
+```
+
+Each page is loaded once, and all 2176 cache bytes are read in one logical
+SPI transaction. The first 2048 bytes go to the main file and the remaining
+128 to the OOB file. Full-chip output sizes are 256 MiB and 16 MiB. A page-sized
+buffer is streamed to disk; no full-chip RAM allocation is needed.
+
+**ECC is temporarily disabled for this paired capture.** Main bytes therefore
+include any physical bit errors, rather than corrections made by the NAND.
+They may differ from an ordinary ECC-enabled `-r` dump if the chip corrected
+errors in that earlier read. Raw main and raw OOB belong together for a
+physical backup. Keep both files; restoring that raw pair uses the writer's
+`--oob-mode raw`, not regenerated ECC over potentially erroneous raw main
+bytes. No `-d` or `--oob-mode` is needed while reading; `--oob-mode` remains
+write-only.
+
+As with `--read-oob`, optional `-a`/`-l` describe a page-aligned main-area range,
+and output starts at byte zero for the selected slice. `--dry-run` checks the
+range and both new paths without USB or file creation. Existing files/symlinks
+are refused. Failure or interruption retains partial outputs and returns an
+error; the final report gives counts for both files. No erase/program or
+protection-register operations occur, and the original ECC configuration is
+restored where communication permits.
+
+The inherited main-read path also now batches each command/address prefix
+instead of sending its bytes as separate acknowledged USB writes, and reuses
+the final ready-status value for ECC checking. Plain `-r MAIN` keeps its
+original ECC-enabled semantics. Required ready checks, chip-select boundaries
+and CH347 acknowledgements are not removed. The paired reader avoids the
+second full traversal previously required by separate main/OOB commands.
+These are software changes, not a measured promise of a particular speedup.
+
 ### Two OOB modes
 
 `--oob-mode metadata` is the default: turn on chip ECC, write the main bytes
@@ -117,8 +160,8 @@ They create no backup directories and request no confirmation phrase.
 Restore matching full-chip captures, **without read-back verification**:
 
 ```sh
-sudo ./SNANDer/src/SNANDer -p ch347 -w hyf2gq4_dump.bin \
-  --oob hyf2gq4_oob.bin --oob-mode raw
+sudo ./SNANDer/src/SNANDer -p ch347 -w dumps/original/hyf2gq4_dump.bin \
+  --oob dumps/original/hyf2gq4_oob.bin --oob-mode raw
 ```
 
 To limit that operation, append `-a ADDRESS -l LENGTH`. For example,
@@ -128,7 +171,7 @@ inputs automatically seeking to that block's main/OOB data.
 Replace OOB metadata while retaining the connected chip's current main data:
 
 ```sh
-sudo ./SNANDer/src/SNANDer -p ch347 --write-oob hyf2gq4_oob.bin
+sudo ./SNANDer/src/SNANDer -p ch347 --write-oob dumps/original/hyf2gq4_oob.bin
 ```
 
 This is **not an in-place spare-only program**. NAND erase clears main and OOB
@@ -182,6 +225,6 @@ make -C src -j1 check
 
 The checks cover CH347 framing/failures and HYF main/OOB preservation, range
 mapping (full-chip files and slices), optional verification, ECC-mode handling
-and failure cleanup, plus raw OOB-only reads with fake programmer calls.
+and failure cleanup, plus raw OOB-only and paired reads with fake programmer calls.
 NAND fixtures use only a few blocks of actual disk/RAM;
 full-chip input mapping is tested with sparse files, not a full-chip buffer.

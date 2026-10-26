@@ -703,17 +703,23 @@ static int wait_read_ready(void)
     }
 }
 
-static int read_spare_page(uint32_t row, unsigned char spare[SPARE_PAGE])
+static int read_capture_page(uint32_t row, unsigned char *bytes, bool paired)
 {
-    /* Cache column 0x0800 skips all 2048 main bytes. The NAND internally
-     * loads a whole page, but only its 128 spare bytes are transferred.
+    /* The raw pair must come from ONE cache read of ONE loaded page. OOB
+     * alone instead starts at column 0x0800 and never transfers main bytes.
      */
-    const unsigned char command[] = {0x03, 0x08, 0x00, 0xff};
+    unsigned char command[] = {0x03, 0x08, 0x00, 0xff};
+    unsigned byte_count = SPARE_PAGE;
+
+    if (paired) {
+        command[1] = 0;
+        byte_count = PAGE_BYTES;
+    }
 
     if (stop_requested || row_command(0x13, row) < 0 ||
         wait_read_ready() < 0 || stop_requested ||
-        transfer(command, sizeof(command), spare, SPARE_PAGE) < 0) {
-        fprintf(stderr, "HYF OOB read stopped/failed at physical row 0x%05"
+        transfer(command, sizeof(command), bytes, byte_count) < 0) {
+        fprintf(stderr, "HYF raw read stopped/failed at physical row 0x%05"
                 PRIx32 ".\n", row);
         return -1;
     }
@@ -729,7 +735,7 @@ static int require_new_output(const char *path)
      * between this read-only check and the actual file creation.
      */
     if (lstat(path, &info) == 0) {
-        fprintf(stderr, "HYF OOB output already exists; choose a new path: %s\n", path);
+        fprintf(stderr, "HYF output already exists; choose a new path: %s\n", path);
         return -1;
     }
 
@@ -741,21 +747,174 @@ static int require_new_output(const char *path)
     return 0;
 }
 
-int hyf_nand_read_oob(const struct hyf_nand_read_options *options)
+/* Resolve only a new output's parent, not the nonexistent output itself.
+ * Comparing parent identity and final name detects two spellings of the
+ * same target, including ../ and symlinked parent directories, in dry runs.
+ */
+static int output_parent(const char *path, struct stat *info, const char **name)
+{
+    const char *slash = strrchr(path, '/');
+    char *directory;
+
+    *name = path;
+
+    if (slash == NULL) {
+        directory = strdup(".");
+    } else {
+        *name = slash + 1;
+        size_t length = (size_t)(slash - path);
+
+        if (length == 0) {
+            length = 1; /* Parent of /name is /, not an empty string. */
+        }
+
+        directory = strndup(path, length);
+    }
+
+    if (directory == NULL) {
+        perror("HYF output parent");
+        return -1;
+    }
+
+    int result = stat(directory, info);
+
+    if (result < 0) {
+        perror(directory);
+    } else if (!S_ISDIR(info->st_mode) || **name == '\0') {
+        fprintf(stderr, "HYF output needs an existing parent directory and filename: %s\n",
+                path);
+        result = -1;
+    }
+
+    free(directory);
+    return result;
+}
+
+static int require_distinct_outputs(const char *main_path, const char *oob_path)
+{
+    struct stat main_parent, oob_parent;
+    const char *main_name, *oob_name;
+
+    if (output_parent(main_path, &main_parent, &main_name) < 0 ||
+        output_parent(oob_path, &oob_parent, &oob_name) < 0) {
+        return -1;
+    }
+
+    if (main_parent.st_dev == oob_parent.st_dev &&
+        main_parent.st_ino == oob_parent.st_ino && strcmp(main_name, oob_name) == 0) {
+        fprintf(stderr, "HYF main and OOB outputs must be different new files.\n");
+        return -1;
+    }
+
+    return 0;
+}
+
+struct capture_output {
+    const char *path;
+    FILE *stream;
+    bool created;
+    uint64_t bytes;
+};
+
+static int open_capture_output(struct capture_output *output)
+{
+    int descriptor = open(output->path, O_WRONLY | O_CREAT | O_EXCL, 0666);
+
+    if (descriptor < 0) {
+        perror(output->path);
+        return -1;
+    }
+
+    output->created = true;
+    output->stream = fdopen(descriptor, "wb");
+
+    if (output->stream == NULL) {
+        perror("HYF capture fdopen");
+
+        if (close(descriptor) < 0) {
+            perror("HYF capture descriptor close");
+        }
+
+        return -1;
+    }
+
+    /* Count actual successful file writes, including a partial last page.
+     * The capture itself is bounded to one page, not a whole image buffer.
+     */
+    if (setvbuf(output->stream, NULL, _IONBF, 0) != 0) {
+        fprintf(stderr, "Cannot configure HYF capture stream: %s\n", output->path);
+        return -1;
+    }
+
+    return 0;
+}
+
+static int write_capture_output(struct capture_output *output,
+                                const unsigned char *bytes, size_t count)
+{
+    size_t written = fwrite(bytes, 1, count, output->stream);
+
+    output->bytes += written;
+
+    if (written != count) {
+        perror(output->path);
+        return -1;
+    }
+
+    return 0;
+}
+
+static int close_capture_output(struct capture_output *output)
+{
+    int result = 0;
+
+    if (output->stream != NULL) {
+        if (fflush(output->stream) != 0) {
+            perror("HYF capture output flush");
+            result = -1;
+        }
+
+        if (fclose(output->stream) != 0) {
+            perror("HYF capture output close");
+            result = -1;
+        }
+
+        output->stream = NULL;
+    }
+
+    return result;
+}
+
+static double capture_elapsed(const struct timespec *start)
+{
+    struct timespec now;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &now) < 0) {
+        perror("CLOCK_MONOTONIC");
+        return -1;
+    }
+
+    return (double)(now.tv_sec - start->tv_sec) +
+        (double)(now.tv_nsec - start->tv_nsec) / 1000000000.0;
+}
+
+int hyf_nand_read(const struct hyf_nand_read_options *options)
 {
     struct sigaction old_interrupt, old_terminate;
     bool interrupt_handler = false, terminate_handler = false;
-    bool output_created = false, config_touched = false;
+    bool config_touched = false;
     unsigned char original_config = 0;
-    FILE *output = NULL;
-    int descriptor = -1, result = -1;
-    uint64_t bytes_written = 0;
+    struct capture_output main_output = {0}, oob_output = {0};
+    struct timespec started;
+    double last_progress = 0;
+    int result = -1;
 
     stop_requested = 0;
 
     if (options == NULL || options->oob_path == NULL || *options->oob_path == '\0' ||
+        (options->main_path != NULL && *options->main_path == '\0') ||
         options->address >= MAIN_CAPACITY || options->address % MAIN_PAGE != 0) {
-        fprintf(stderr, "HYF OOB read needs a new output and page-aligned main address.\n");
+        fprintf(stderr, "HYF raw read needs new outputs and a page-aligned main address.\n");
         return -1;
     }
 
@@ -766,24 +925,47 @@ int hyf_nand_read_oob(const struct hyf_nand_read_options *options)
     }
 
     /* Subtract before comparing: even UINT64_MAX cannot wrap the bound. */
-    if (length > MAIN_CAPACITY - options->address || length % MAIN_PAGE != 0 ||
-        require_new_output(options->oob_path) < 0) {
-        fprintf(stderr, "HYF OOB range/output invalid; range must be whole pages"
+    if (length > MAIN_CAPACITY - options->address || length % MAIN_PAGE != 0) {
+        fprintf(stderr, "HYF raw range invalid; range must be whole pages"
                 " within 256 MiB.\n");
         return -1;
     }
 
-    uint64_t expected_bytes = length / MAIN_PAGE * SPARE_PAGE;
+    /* Validate BOTH absent paths before creating either output. Exclusive
+     * opens remain necessary because another process can race validation.
+     */
+    if (require_new_output(options->oob_path) < 0 ||
+        (options->main_path != NULL &&
+         (require_new_output(options->main_path) < 0 ||
+          require_distinct_outputs(options->main_path, options->oob_path) < 0))) {
+        return -1;
+    }
+
+    bool paired = options->main_path != NULL;
+    uint64_t expected_oob = length / MAIN_PAGE * SPARE_PAGE;
     uint32_t first_row = (uint32_t)(options->address / MAIN_PAGE);
     uint32_t page_count = (uint32_t)(length / MAIN_PAGE);
 
-    printf("HYF raw OOB read: main range [0x%08" PRIx64 ",0x%08" PRIx64
-           "), %" PRIu32 " physical pages, %" PRIu64 " output bytes.\n",
-           options->address, options->address + length, page_count, expected_bytes);
+    printf("HYF raw %s read: main range [0x%08" PRIx64 ",0x%08" PRIx64
+           "), %" PRIu32 " physical pages; main %" PRIu64 ", OOB %" PRIu64 " bytes.\n",
+           paired ? "main+OOB" : "OOB-only", options->address,
+           options->address + length, page_count, paired ? length : 0, expected_oob);
+
+    if (paired) {
+        puts("RAW main is UNCORRECTED (ECC off); it may differ from a legacy ECC read.");
+    }
 
     if (options->dry_run) {
         puts("DRY RUN: range/new output validated; no file created or SPI/USB calls made.");
         return 0;
+    }
+
+    main_output.path = options->main_path;
+    oob_output.path = options->oob_path;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &started) < 0) {
+        perror("CLOCK_MONOTONIC");
+        return -1;
     }
 
     struct sigaction action;
@@ -811,28 +993,8 @@ int hyf_nand_read_oob(const struct hyf_nand_read_options *options)
      * Check/open output before sending commands, so path failures do not
      * needlessly change the chip configuration.
      */
-    descriptor = open(options->oob_path, O_WRONLY | O_CREAT | O_EXCL, 0666);
-
-    if (descriptor < 0) {
-        perror(options->oob_path);
-        goto cleanup;
-    }
-
-    output_created = true;
-    output = fdopen(descriptor, "wb");
-
-    if (output == NULL) {
-        perror("HYF OOB fdopen");
-        goto cleanup;
-    }
-
-    descriptor = -1; /* The FILE now owns this descriptor. */
-
-    /* A tiny, unbuffered stream makes the reported partial byte count the
-     * actual successful file-write count, even on an interrupted capture.
-     */
-    if (setvbuf(output, NULL, _IONBF, 0) != 0) {
-        fprintf(stderr, "Cannot configure HYF OOB output stream.\n");
+    if ((paired && open_capture_output(&main_output) < 0) ||
+        open_capture_output(&oob_output) < 0) {
         goto cleanup;
     }
 
@@ -845,7 +1007,7 @@ int hyf_nand_read_oob(const struct hyf_nand_read_options *options)
     }
 
     if (id[0] != 0xc9 || id[1] != 0x52) {
-        fprintf(stderr, "Expected HYF C9:52, observed %02x:%02x; no OOB captured.\n",
+        fprintf(stderr, "Expected HYF C9:52, observed %02x:%02x; no data captured.\n",
                 id[0], id[1]);
         goto cleanup;
     }
@@ -855,7 +1017,7 @@ int hyf_nand_read_oob(const struct hyf_nand_read_options *options)
     }
 
     if ((original_config & CONFIG_OTP) != 0) {
-        fprintf(stderr, "HYF OTP mode enabled; refusing normal-array OOB capture.\n");
+        fprintf(stderr, "HYF OTP mode enabled; refusing normal-array raw capture.\n");
         goto cleanup;
     }
 
@@ -874,25 +1036,41 @@ int hyf_nand_read_oob(const struct hyf_nand_read_options *options)
     }
 
     for (uint32_t page = 0; page < page_count; page++) {
-        unsigned char spare[SPARE_PAGE];
+        unsigned char bytes[PAGE_BYTES];
 
-        if (read_spare_page(first_row + page, spare) < 0) {
+        if (read_capture_page(first_row + page, bytes, paired) < 0) {
             goto cleanup;
         }
 
-        size_t written = fwrite(spare, 1, sizeof(spare), output);
+        const unsigned char *spare = bytes;
 
-        bytes_written += written;
+        if (paired) {
+            if (write_capture_output(&main_output, bytes, MAIN_PAGE) < 0) {
+                goto cleanup;
+            }
 
-        if (written != sizeof(spare)) {
-            perror("HYF OOB output write");
+            spare = bytes + MAIN_PAGE;
+        }
+
+        if (write_capture_output(&oob_output, spare, SPARE_PAGE) < 0) {
             goto cleanup;
         }
 
-        if ((page + 1) % 4096 == 0) {
-            printf("OOB: %" PRIu32 "/%" PRIu32 " pages (%" PRIu64 " bytes).\n",
-                   page + 1, page_count, bytes_written);
+        double elapsed = capture_elapsed(&started);
+
+        if (elapsed < 0) {
+            goto cleanup;
+        }
+
+        if (elapsed - last_progress >= 1.0 || page + 1 == page_count) {
+            uint64_t total = main_output.bytes + oob_output.bytes;
+            double rate = elapsed > 0 ? (double)total / elapsed / 1024.0 : 0;
+
+            printf("RAW: %" PRIu32 "/%" PRIu32 " pages; main %" PRIu64
+                   ", OOB %" PRIu64 " bytes; %.1f s, %.1f KiB/s.\n",
+                   page + 1, page_count, main_output.bytes, oob_output.bytes, elapsed, rate);
             fflush(stdout);
+            last_progress = elapsed;
         }
     }
 
@@ -915,20 +1093,11 @@ cleanup:
         }
     }
 
-    if (output != NULL) {
-        if (fflush(output) != 0) {
-            perror("HYF OOB output flush");
-            result = -1;
-        }
-
-        if (fclose(output) != 0) {
-            perror("HYF OOB output close");
-            result = -1;
-        }
+    if (close_capture_output(&main_output) < 0) {
+        result = -1;
     }
 
-    if (descriptor >= 0 && close(descriptor) < 0) {
-        perror("HYF OOB descriptor close");
+    if (close_capture_output(&oob_output) < 0) {
         result = -1;
     }
 
@@ -943,15 +1112,45 @@ cleanup:
     }
 
     if (stop_requested) {
-        fprintf(stderr, "HYF OOB capture interrupted by signal %d.\n", (int)stop_requested);
+        fprintf(stderr, "HYF raw capture interrupted by signal %d.\n", (int)stop_requested);
         result = -1;
     }
 
-    if (output_created) {
+    double elapsed = capture_elapsed(&started);
+
+    if (elapsed < 0) {
+        result = -1;
+    }
+
+    const char *outcome = result == 0 ? "COMPLETE" : "PARTIAL/ERROR";
+
+    if (main_output.created) {
+        printf("%s main capture retained: %" PRIu64 "/%" PRIu64 " bytes in %s.\n",
+               outcome, main_output.bytes, length, main_output.path);
+    }
+
+    if (oob_output.created) {
         printf("%s OOB capture retained: %" PRIu64 "/%" PRIu64 " bytes in %s.\n",
-               result == 0 ? "COMPLETE" : "PARTIAL/ERROR", bytes_written,
-               expected_bytes, options->oob_path);
+               outcome, oob_output.bytes, expected_oob, oob_output.path);
+    }
+
+    if (elapsed >= 0) {
+        uint64_t total = main_output.bytes + oob_output.bytes;
+        double rate = elapsed > 0 ? (double)total / elapsed / 1024.0 : 0;
+
+        printf("Raw capture elapsed %.3f s; %" PRIu64 " total bytes, %.1f KiB/s.\n",
+               elapsed, total, rate);
     }
 
     return result;
+}
+
+int hyf_nand_read_oob(const struct hyf_nand_read_options *options)
+{
+    if (options != NULL && options->main_path != NULL) {
+        fprintf(stderr, "OOB-only entry point does not accept a main output.\n");
+        return -1;
+    }
+
+    return hyf_nand_read(options);
 }

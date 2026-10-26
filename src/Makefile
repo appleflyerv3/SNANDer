@@ -46,10 +46,17 @@ TEST_CFLAGS = -O1 -std=c99 -Wall -Wextra -Werror -UNDEBUG
 	mkdir -p ../build
 	$(CC) $(TEST_CFLAGS) -I. tests/test_hyf_oob_read.c hyf_nand.c -o $@
 
-check: ../build/test_ch347_spi ../build/test_hyf_nand ../build/test_hyf_oob_read
+# This harness includes the inherited NAND module to exercise private
+# protocol routines; use that module's GNU99 build/warning flags.
+../build/test_spi_nand_batch: tests/test_spi_nand_batch.c spi_nand_flash.c spi_nand_flash.h spi_controller.h timer.h
+	mkdir -p ../build
+	$(CC) -O1 -std=gnu99 -Wall -UNDEBUG -I. tests/test_spi_nand_batch.c -o $@
+
+check: ../build/test_ch347_spi ../build/test_hyf_nand ../build/test_hyf_oob_read ../build/test_spi_nand_batch
 	../build/test_ch347_spi
 	../build/test_hyf_nand
 	../build/test_hyf_oob_read
+	../build/test_spi_nand_batch
 
 clean:
 	rm -f $(OBJS) $(OBJS:.o=.d) SNANDer

@@ -1712,15 +1712,15 @@ static SPI_NAND_FLASH_RTN_T spi_nand_protocol_set_feature( u8 addr, u8 data )
 static SPI_NAND_FLASH_RTN_T spi_nand_protocol_get_feature( u8 addr, u8 *ptr_rtn_data )
 {
 	SPI_NAND_FLASH_RTN_T rtn_status = SPI_NAND_FLASH_RTN_NO_ERROR;
+	u8 command[] = { _SPI_NAND_OP_GET_FEATURE, addr };
 
 	/* 1. Chip Select low */
 	_SPI_NAND_READ_CHIP_SELECT_LOW();
 
-	/* 2. Send 0Fh opcode (Get Feature) */
-	_SPI_NAND_WRITE_ONE_BYTE( _SPI_NAND_OP_GET_FEATURE );
-
-	/* 3. Offset addr */
-	_SPI_NAND_WRITE_ONE_BYTE( addr );
+	/* 2-3. Send opcode and address together, with the same CS held low.
+	 * Each separate write otherwise costs a USB command/acknowledgement.
+	 */
+	_SPI_NAND_WRITE_NBYTE( command, sizeof(command), SPI_CONTROLLER_SPEED_SINGLE );
 
 	/* 4. Read 1 byte data */
 	_SPI_NAND_READ_NBYTE( ptr_rtn_data, _SPI_NAND_LEN_ONE_BYTE, SPI_CONTROLLER_SPEED_SINGLE);
@@ -2218,6 +2218,8 @@ static SPI_NAND_FLASH_RTN_T spi_nand_protocol_read_from_cache( u32 data_offset, 
 {
 	struct SPI_NAND_FLASH_INFO_T *ptr_dev_info_t;
 	SPI_NAND_FLASH_RTN_T rtn_status = SPI_NAND_FLASH_RTN_NO_ERROR;
+	u8 command[5];
+	u32 command_length = 0;
 
 	ptr_dev_info_t = _SPI_NAND_GET_DEVICE_INFO_PTR;
 
@@ -2229,59 +2231,64 @@ static SPI_NAND_FLASH_RTN_T spi_nand_protocol_read_from_cache( u32 data_offset, 
 	{
 		/* 03h */
 		case SPI_NAND_FLASH_READ_SPEED_MODE_SINGLE:
-			_SPI_NAND_WRITE_ONE_BYTE( _SPI_NAND_OP_READ_FROM_CACHE_SINGLE );
+			command[command_length++] = _SPI_NAND_OP_READ_FROM_CACHE_SINGLE;
 			break;
 
 		/* 3Bh */
 		case SPI_NAND_FLASH_READ_SPEED_MODE_DUAL:
-			_SPI_NAND_WRITE_ONE_BYTE( _SPI_NAND_OP_READ_FROM_CACHE_DUAL );
+			command[command_length++] = _SPI_NAND_OP_READ_FROM_CACHE_DUAL;
 			break;
 
 		/* 6Bh */
 		case SPI_NAND_FLASH_READ_SPEED_MODE_QUAD:
-			_SPI_NAND_WRITE_ONE_BYTE( _SPI_NAND_OP_READ_FROM_CACHE_QUAD );
+			command[command_length++] = _SPI_NAND_OP_READ_FROM_CACHE_QUAD;
 			break;
 
 		default:
 			break;
 	}
 #else
-	_SPI_NAND_WRITE_ONE_BYTE( _SPI_NAND_OP_READ_FROM_CACHE_SINGLE );
+	command[command_length++] = _SPI_NAND_OP_READ_FROM_CACHE_SINGLE;
 #endif
 	/* 3. Send data_offset addr */
 	if( dummy_mode == SPI_NAND_FLASH_READ_DUMMY_BYTE_PREPEND )
 	{
-		_SPI_NAND_WRITE_ONE_BYTE( (0xff) );	/* dummy byte */
+		command[command_length++] = 0xff;	/* dummy byte */
 	}
 
 	if( ((ptr_dev_info_t->feature) & SPI_NAND_FLASH_PLANE_SELECT_HAVE) )
 	{
 		if( _plane_select_bit == 0)
 		{
-			_SPI_NAND_WRITE_ONE_BYTE( ((data_offset >> 8 ) &(0xef)) );
+			command[command_length++] = (data_offset >> 8) & 0xef;
 		}
 		if( _plane_select_bit == 1)
 		{
-			_SPI_NAND_WRITE_ONE_BYTE( ((data_offset >> 8 ) | (0x10)) );
+			command[command_length++] = (data_offset >> 8) | 0x10;
 		}
 	}
 	else
 	{
-		_SPI_NAND_WRITE_ONE_BYTE( ((data_offset >> 8 ) &(0xff)) );
+		command[command_length++] = (data_offset >> 8) & 0xff;
 	}
 
-	_SPI_NAND_WRITE_ONE_BYTE( ((data_offset      ) &(0xff)) );
+	command[command_length++] = data_offset & 0xff;
 
 	if( dummy_mode == SPI_NAND_FLASH_READ_DUMMY_BYTE_APPEND )
 	{
-		_SPI_NAND_WRITE_ONE_BYTE( (0xff) );	/* dummy byte */
+		command[command_length++] = 0xff;	/* dummy byte */
 	}
 
 	if( dummy_mode == SPI_NAND_FLASH_READ_DUMMY_BYTE_PREPEND && 
 	  ((read_mode == SPI_NAND_FLASH_READ_SPEED_MODE_DUAL) || (read_mode == SPI_NAND_FLASH_READ_SPEED_MODE_QUAD)))
 	{
-		_SPI_NAND_WRITE_ONE_BYTE(0xff);		/* for dual/quad read dummy byte */
+		command[command_length++] = 0xff;	/* for dual/quad read dummy byte */
 	}
+
+	/* Preserve all opcode/plane/dummy bytes, but transfer this bounded prefix
+	 * in one write. The following data read remains inside the same CS.
+	 */
+	_SPI_NAND_WRITE_NBYTE( command, command_length, SPI_CONTROLLER_SPEED_SINGLE );
 
 	/* 4. Read n byte (len) data */
 	switch (read_mode)
@@ -2519,14 +2526,11 @@ static void spi_nand_select_die ( u32 page_number )
 	}
 }
 
-static SPI_NAND_FLASH_RTN_T ecc_fail_check( u32 page_number )
+static SPI_NAND_FLASH_RTN_T ecc_fail_check( u32 page_number, u8 status )
 {
-	u8 status;
 	struct SPI_NAND_FLASH_INFO_T *ptr_dev_info_t;
 	SPI_NAND_FLASH_RTN_T rtn_status = SPI_NAND_FLASH_RTN_NO_ERROR;
 	ptr_dev_info_t = _SPI_NAND_GET_DEVICE_INFO_PTR;
-
-	spi_nand_protocol_get_status_reg_3( &status);
 
 	_SPI_NAND_DEBUG_PRINTF(SPI_NAND_FLASH_DEBUG_LEVEL_1, "ecc_fail_check: status = 0x%x\n", status);
 
@@ -2808,7 +2812,10 @@ static SPI_NAND_FLASH_RTN_T spi_nand_load_page_into_cache( u32 page_number)
 
 		_SPI_NAND_DEBUG_PRINTF(SPI_NAND_FLASH_DEBUG_LEVEL_1, "spi_nand_load_page_into_cache : status = 0x%x\n", status);
 		if (ECC_fcheck && !ECC_ignore)
-			rtn_status = ecc_fail_check(page_number);
+			/* The final ready poll already contains this page's ECC result.
+			 * Decode it without issuing another identical C0 status read.
+			 */
+			rtn_status = ecc_fail_check(page_number, status);
 		else
 			rtn_status = 0;
 	}

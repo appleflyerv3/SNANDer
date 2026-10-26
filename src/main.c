@@ -90,7 +90,7 @@ void usage(void)
 	printf(
 		" -p <name>      SPI programmer: ch341a (default) or ch347\n"
 		" --spi-clock HZ CH347 clock: 60000000 divided by a power of two (default 3750000)\n"
-		" --oob FILE     separate HYF2GQ4UAACAE OOB input, used with -w MAIN\n"
+		" --oob FILE     HYF OOB file: -w MAIN restores both; -r MAIN captures both raw\n"
 		" --write-oob FILE  replace OOB while preserving live main data block by block\n"
 		" --read-oob FILE   save raw OOB only to a NEW file; main bytes are not transferred\n"
 		" --oob-mode MODE   writes only: metadata (default, regenerate ECC) or raw\n"
@@ -172,7 +172,7 @@ int main(int argc, char* argv[])
 			case OPT_OOB:
 			case OPT_WRITE_OOB:
 				if (oob_file) {
-					fprintf(stderr, "Specify only one OOB input.\n");
+					fprintf(stderr, "Specify only one OOB file.\n");
 					return 2;
 				}
 				oob_file = optarg;
@@ -337,12 +337,15 @@ int main(int argc, char* argv[])
 	}
 #endif
 
-	if (op == 'R') {
-		/* A capture is always raw and exactly physical: writer modes,
-		 * verification and bad-page skipping do not apply to this operation.
+	if (op == 'R' || (op == 'r' && oob_file)) {
+		/* Separate-OOB captures are always raw and exactly physical. A paired
+		 * read saves matching main/spare bytes from ONE cache load, rather
+		 * than mixing ECC-corrected main with a later raw spare capture.
+		 * Plain -r without --oob retains its legacy ECC behavior below.
 		 */
-		if (oob_file || oob_mode >= 0 || vr || ECC_ignore || Skip_BAD_page || OOB_size) {
-			fprintf(stderr, "--read-oob saves raw OOB; do not combine it with write/ECC/verify options.\n");
+		if ((op == 'R' && oob_file) || oob_mode >= 0 || vr ||
+		    ECC_ignore || Skip_BAD_page || OOB_size) {
+			fprintf(stderr, "Separate-OOB reads are raw; do not combine them with write/ECC/verify options.\n");
 			return 2;
 		}
 #ifdef EEPROM_SUPPORT
@@ -352,16 +355,21 @@ int main(int argc, char* argv[])
 		}
 #endif
 		struct hyf_nand_read_options options = {
+			.main_path = NULL,
 			.oob_path = oob_output,
 			.address = (uint64_t)addr,
 			.length = (uint64_t)len,
 			.dry_run = dry_run,
 		};
+		if (op == 'r') {
+			options.main_path = fname;
+			options.oob_path = oob_file;
+		}
 
 		if (!dry_run && programmer_init() < 0)
 			return 1;
 
-		int result = hyf_nand_read_oob(&options);
+		int result = hyf_nand_read(&options);
 		if (!dry_run && programmer_shutdown() < 0)
 			result = -1;
 

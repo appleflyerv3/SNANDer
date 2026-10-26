@@ -49,7 +49,9 @@ struct hyf_nand_options {
 int hyf_nand_write(const struct hyf_nand_options *options);
 
 struct hyf_nand_read_options {
-    /* New OOB-only output; existing files and symlinks are never replaced. */
+    /* Optional new raw-main output. NULL keeps the OOB-only USB transfer. */
+    const char *main_path;
+    /* Required new OOB output; existing files/symlinks are never replaced. */
     const char *oob_path;
     /* Physical MAIN-byte coordinates, aligned to 2048-byte pages, not OOB
      * file offsets. A zero length selects the remainder of the 256-MiB chip.
@@ -59,8 +61,12 @@ struct hyf_nand_read_options {
     bool dry_run;
 };
 
-/* Capture all 128 raw spare bytes of each selected physical page in order.
- * Only spare bytes cross USB: the chip still loads each page into its cache.
+/* Capture raw main+OOB as a matched pair, or only OOB if main_path is NULL.
+ * Each physical page is loaded once, followed by one cache read: 2176 bytes
+ * split into 2048-byte main and 128-byte OOB outputs, or only 128 spare bytes
+ * at column 0x0800. Both files follow the same selected physical page order.
+ * RAW MAIN IS UNCORRECTED and may differ from the legacy ECC-enabled read;
+ * the paired mode is intended to save the raw data together with its OOB.
  * ECC is temporarily disabled and the original B0 configuration restored;
  * OTP mode is refused. A0, WEL and main/spare flash contents are not changed.
  * No erase, program, write-enable or write-disable commands are issued.
@@ -68,8 +74,11 @@ struct hyf_nand_read_options {
  * The caller initializes the chosen programmer, except for dry_run, which
  * validates the range/new output path without SPI/USB or file creation.
  * Interrupted/failed captures retain their partial output and return -1.
- * Returns 0 only after the complete file and ordinary cleanup succeed.
+ * Returns 0 only after the complete output(s) and ordinary cleanup succeed.
  */
+int hyf_nand_read(const struct hyf_nand_read_options *options);
+
+/* Compatibility OOB-only entry point; refuses a non-NULL main_path. */
 int hyf_nand_read_oob(const struct hyf_nand_read_options *options);
 
 #endif
