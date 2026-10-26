@@ -188,6 +188,29 @@ polling, cache transfer and file-output timing, and count busy replies.
 The user-provided pre-change CH347T baseline at 60 MHz was **9.080 seconds,
 958.5 KiB/s** for 8 MiB main plus 512 KiB OOB (4096 physical pages). Keep
 `perf_before_main.bin` and `perf_before_oob.bin` for exact comparison.
+
+The user then ran both updated modes on the same CH347T, reporting adapter
+firmware `0x0544` (independently queried through CA; USB `bcdDevice` also
+reported `0x0544`). Results for that same range:
+
+| Mode | Elapsed | Combined throughput | Speedup over baseline |
+| --- | ---: | ---: | ---: |
+| Before these changes | 9.080 s | 958.5 KiB/s | 1.00x |
+| Improved normal | 5.213 s | 1669.6 KiB/s | 1.74x |
+| C2 DMA | 3.160 s | 2754.6 KiB/s | 2.87x |
+
+All four `cmp` comparisons passed; independently rechecked locally with
+matching SHA-256 values across all three captures:
+
+- Main: `5c98467380d0ad5449b12c0f11764666d487e6bc2d2060fdffa9c1b0c5df33d0`
+- OOB: `e9f172d106661ad1f505eb1a387b22e8a41e3f8822b8a7f8b2cc02f82d780bbe`
+
+DMA logged more busy replies (7635 versus 3913), but spent less time polling
+(1.047 versus 2.081 seconds): faster status transactions can observe a still-
+busy page more often. Neither mode inserted polling sleeps. File-output time
+was about 0.01 seconds in each updated run. These measurements validate this
+8-MiB raw read range on this adapter/chip, not full-chip captures or writes.
+
 From `/home/appleflyer/dict/dumps/bkp1`, run the improved normal mode first:
 
 ```sh
@@ -292,7 +315,8 @@ Original notices are retained; no proprietary vendor USB library is linked.
 
 Hardware-free tests use fake USB/programmer implementations. They cannot
 open a physical programmer. Passing them does not establish electrical or
-hardware compatibility. **No real chip has been programmed with this new code yet.**
+hardware compatibility. The read-only hardware comparison above validates
+the tested range. **No real chip has been programmed with this new code yet.**
 
 ```sh
 make -C src -j1 check
