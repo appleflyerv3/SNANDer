@@ -76,6 +76,20 @@ int programmer_select_chip(bool active)
     return 0;
 }
 
+int programmer_transaction(unsigned int write_count, unsigned int read_count,
+    const unsigned char *write_data, unsigned char *read_data)
+{
+    if (programmer_select_chip(true) < 0) {
+        (void)programmer_select_chip(false);
+        return -1;
+    }
+
+    int result = programmer_send_command(write_count, read_count, write_data, read_data);
+    int released = programmer_select_chip(false);
+
+    return result < 0 || released < 0 ? -1 : 0;
+}
+
 int programmer_send_command(unsigned int write_count, unsigned int read_count,
     const unsigned char *write_data, unsigned char *read_data)
 {

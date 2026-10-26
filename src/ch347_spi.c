@@ -13,6 +13,14 @@
  * driver/ch34x_mphsi_master_spi.c in WCHSoftGroup/ch34x_mphsi_master_linux:
  * GET_CFG is CA/01/00/01, config payload is 26 bytes, and INIT/OUT status
  * byte zero means success. No proprietary vendor library is linked.
+ *
+ * Optional DMA/automatic-CS C2 transport is adapted from WCH's GPL-2.0+
+ * driver, Copyright (C) 2026 Nanjing Qinheng Microelectronics Co., Ltd.:
+ * https://github.com/WCHSoftGroup/ch34x_mphsi_master_linux/tree/57be7ed01e2adb14d34bcca5e1eb71ff6247aba7
+ * ch34x_mphsi_master_spi.c: ch347_spi_native_dma (medium mode);
+ * ch34x_mphsi_master_usb.c: ch347_get_chipinfo;
+ * ch34x_mphsi.h: 4093-byte C2 payload limit. E1 is clock control and
+ * E2 is CH347F function switching; neither enables DMA here.
  */
 #include "ch347_spi.h"
 
@@ -31,6 +39,7 @@ enum {
     CH347_READ_EP = 0x86,
     CH347_CMD_SET_CONFIG = 0xc0,
     CH347_CMD_CHIP_SELECT = 0xc1,
+    CH347_CMD_DUPLEX = 0xc2,
     CH347_CMD_READ = 0xc3,
     CH347_CMD_WRITE = 0xc4,
     CH347_CMD_GET_CONFIG = 0xca,
@@ -44,6 +53,10 @@ enum {
     CH347_USB_TIMEOUT_MS = 10000,
     CH347_MAX_CLOCK_HZ = 60000000,
     CH347_DEFAULT_DIVISOR = 4,
+    CH347_DMA_PACKET_BYTES = 4096,
+    CH347_DMA_DATA_BYTES = CH347_DMA_PACKET_BYTES - CH347_HEADER_BYTES,
+    CH347_DMA_MAX_TRANSFER = 64 * 1024 - 16 * CH347_HEADER_BYTES,
+    CH347T_DMA_MIN_FIRMWARE = 0x0341,
 };
 
 /* A private libusb context avoids sharing the CH341 driver's default context.
@@ -53,6 +66,9 @@ static struct {
     libusb_context *usb;
     libusb_device_handle *handle;
     int interface;
+    uint16_t product_id;
+    uint16_t usb_revision;
+    uint16_t firmware;
     bool claimed;
     bool detached;
     bool selected;
@@ -60,6 +76,7 @@ static struct {
 } device;
 
 static unsigned int clock_divisor = CH347_DEFAULT_DIVISOR;
+static bool dma_mode;
 
 static void put_le16(uint8_t *bytes, unsigned int value)
 {
@@ -216,6 +233,74 @@ int ch347_spi_set_clock(unsigned int hz)
     return -1;
 }
 
+int ch347_spi_set_mode(const char *mode)
+{
+    if (device.usb != NULL) {
+        fprintf(stderr, "Set the CH347 transfer mode before initialization.\n");
+        return -1;
+    }
+
+    if (mode != NULL && strcmp(mode, "normal") == 0) {
+        dma_mode = false;
+        return 0;
+    }
+
+    if (mode != NULL && strcmp(mode, "dma") == 0) {
+        dma_mode = true;
+        return 0;
+    }
+
+    fprintf(stderr, "Unknown CH347 mode; use normal or dma.\n");
+    return -1;
+}
+
+static int identify_adapter(void)
+{
+    struct libusb_device_descriptor descriptor;
+    libusb_device *usb_device = libusb_get_device(device.handle);
+
+    if (usb_device == NULL ||
+        libusb_get_device_descriptor(usb_device, &descriptor) != 0) {
+        fprintf(stderr, "Cannot read the CH347 USB descriptor.\n");
+        return -1;
+    }
+
+    if (descriptor.idVendor != CH347_VENDOR_ID ||
+        descriptor.idProduct != device.product_id) {
+        fprintf(stderr, "CH347 USB descriptor identity mismatch.\n");
+        return -1;
+    }
+
+    device.usb_revision = descriptor.bcdDevice;
+
+    /* WCH queries selector zero for four chip-info bytes. The first two
+     * encode firmware LE16; bcdDevice is a separate USB descriptor value.
+     */
+    uint8_t selector = 0;
+    uint8_t info[4];
+    unsigned int length;
+
+    if (write_packet(CH347_CMD_GET_CONFIG, &selector, 1) != 0 ||
+        read_packet(CH347_CMD_GET_CONFIG, info, sizeof(info), &length) != 0 ||
+        length != sizeof(info)) {
+        fprintf(stderr, "Cannot obtain a complete CH347 firmware revision.\n");
+        return -1;
+    }
+
+    device.firmware = info[0] | ((uint16_t)info[1] << 8);
+    printf("CH347 USB bcdDevice: 0x%04x; adapter firmware: 0x%04x; mode: %s.\n",
+        device.usb_revision, device.firmware, dma_mode ? "dma" : "normal");
+
+    if (dma_mode && device.product_id == CH347T_PRODUCT_ID &&
+        device.firmware < CH347T_DMA_MIN_FIRMWARE) {
+        fprintf(stderr, "CH347T DMA requires firmware >=0x0341 according to WCH; "
+            "use --ch347-mode normal for this adapter.\n");
+        return -1;
+    }
+
+    return 0;
+}
+
 static int configure_spi(void)
 {
     uint8_t config[CH347_CONFIG_BYTES];
@@ -292,6 +377,7 @@ int ch347_spi_init(void)
 
         if (device.handle != NULL) {
             device.interface = variants[index].interface;
+            device.product_id = variants[index].product_id;
             name = variants[index].name;
             break;
         }
@@ -336,7 +422,7 @@ int ch347_spi_init(void)
 
     device.claimed = true;
 
-    if (configure_spi() != 0) {
+    if (identify_adapter() != 0 || configure_spi() != 0) {
         device.failed = true;
         (void)ch347_spi_shutdown();
         return -1;
@@ -433,6 +519,148 @@ int ch347_spi_send_command(unsigned int writecnt, unsigned int readcnt,
 
     /* CS stays asserted until the caller's explicit Chip_Select_High. */
     return 0;
+}
+
+/* WCH's bulk helper accumulates IN fragments of one DMA reply until the
+ * requested total is present. A short USB completion is not another C2
+ * frame: do not issue SPI again or expect an extra header in the middle.
+ */
+static int read_dma_reply(uint8_t *packet, unsigned int payload_bytes)
+{
+    unsigned int received = 0;
+    unsigned int expected = CH347_HEADER_BYTES + payload_bytes;
+
+    while (received < expected) {
+        int transferred = 0;
+        int result = libusb_bulk_transfer(device.handle, CH347_READ_EP,
+            packet + received, (int)(expected - received), &transferred,
+            CH347_USB_TIMEOUT_MS);
+
+        if (result != 0 || transferred <= 0 ||
+            transferred > (int)(expected - received)) {
+            fprintf(stderr, "CH347 DMA USB read failed: %s, %d bytes.\n",
+                libusb_error_name(result), transferred);
+            return -1;
+        }
+
+        received += (unsigned int)transferred;
+    }
+
+    /* The upper nibble is CS control, not part of the 12-bit C2 length.
+     * Do not invent an echo/zero requirement for those response control bits:
+     * WCH validates opcode and total length, not their returned values.
+     */
+    unsigned int length = packet[1] | ((unsigned int)(packet[2] & 0x0f) << 8);
+
+    if (packet[0] != CH347_CMD_DUPLEX || length != payload_bytes) {
+        fprintf(stderr, "CH347 DMA returned an invalid opcode/payload length.\n");
+        return -1;
+    }
+
+    return 0;
+}
+
+static int dma_transaction(unsigned int writecnt, unsigned int readcnt,
+    const unsigned char *writearr, unsigned char *readarr)
+{
+    uint8_t output[CH347_DMA_PACKET_BYTES];
+    uint8_t input[CH347_DMA_PACKET_BYTES];
+
+    /* Match WCH's bounded medium-mode transfer domain. Check subtraction
+     * before forming the sum, including on hosts with 32-bit unsigned int.
+     */
+    if (readcnt > CH347_DMA_MAX_TRANSFER ||
+        writecnt > CH347_DMA_MAX_TRANSFER - readcnt) {
+        fprintf(stderr, "CH347 DMA transaction exceeds %u SPI bytes.\n",
+            (unsigned int)CH347_DMA_MAX_TRANSFER);
+        return fail_session();
+    }
+
+    unsigned int total = writecnt + readcnt;
+
+    for (unsigned int offset = 0; offset < total;) {
+        unsigned int length = total - offset;
+
+        if (length > CH347_DMA_DATA_BYTES) {
+            length = CH347_DMA_DATA_BYTES;
+        }
+
+        output[0] = CH347_CMD_DUPLEX;
+        put_le16(output + 1, length);
+
+        if (offset == 0) {
+            output[2] |= 0x80; /* CS0 active on the first frame only. */
+        }
+
+        if (offset + length == total) {
+            output[2] |= 0x40; /* CS0 inactive after the final frame. */
+        }
+
+        unsigned int prefix = 0;
+
+        if (offset < writecnt) {
+            prefix = writecnt - offset;
+
+            if (prefix > length) {
+                prefix = length;
+            }
+
+            memcpy(output + CH347_HEADER_BYTES, writearr + offset, prefix);
+        }
+
+        /* Match configure_spi's zero default MOSI byte during reads. Full
+         * duplex receives prefix garbage too; only the following read bytes
+         * belong to the caller. Write-only transactions still drain replies.
+         */
+        memset(output + CH347_HEADER_BYTES + prefix, 0, length - prefix);
+        device.selected = true;
+
+        if (usb_write(output, CH347_HEADER_BYTES + length) != 0 ||
+            read_dma_reply(input, length) != 0) {
+            return fail_session();
+        }
+
+        if (length > prefix) {
+            memcpy(readarr + (offset + prefix - writecnt),
+                input + CH347_HEADER_BYTES + prefix, length - prefix);
+        }
+
+        offset += length;
+    }
+
+    device.selected = false;
+    return 0;
+}
+
+int ch347_spi_transaction(unsigned int writecnt, unsigned int readcnt,
+    const unsigned char *writearr, unsigned char *readarr)
+{
+    if (!device.claimed || device.failed) {
+        return -1;
+    }
+
+    if (device.selected || (writecnt != 0 && writearr == NULL) ||
+        (readcnt != 0 && readarr == NULL)) {
+        fprintf(stderr, "CH347 transaction needs inactive CS and valid data buffers.\n");
+        return fail_session();
+    }
+
+    if (writecnt == 0 && readcnt == 0) {
+        return 0;
+    }
+
+    if (dma_mode) {
+        return dma_transaction(writecnt, readcnt, writearr, readarr);
+    }
+
+    if (ch347_spi_select_chip(true) != 0) {
+        return -1;
+    }
+
+    int result = ch347_spi_send_command(writecnt, readcnt, writearr, readarr);
+    int released = ch347_spi_select_chip(false);
+
+    return result == 0 && released == 0 ? 0 : -1;
 }
 
 int ch347_spi_shutdown(void)

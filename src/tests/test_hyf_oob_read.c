@@ -21,17 +21,20 @@
 enum {
     MAIN_PAGE = 2048, OOB_PAGE = 128, PAGE_BYTES = MAIN_PAGE + OOB_PAGE,
     CHIP_BYTES = 0x10000000,
-    FIRST_ROW = 263 * 64 + 3, TEST_PAGES = 3,
+    FIRST_ROW = 263 * 64 + 3, TEST_PAGES = 3, BUFFER_PAGES = 33,
+    OOB_BUFFER_PAGES = 64 * 1024 / OOB_PAGE + 1,
 };
 
 static bool selected, wrong_id, interrupt_busy, paired_mode;
 static unsigned char config, saved_config;
 static unsigned calls, selections, config_writes, page_loads, cache_reads;
 static unsigned cache_read_bytes;
+static unsigned status_polls, busy_responses, busy_per_page, busy_left;
 static unsigned first_row, row_count, loaded_row;
 static unsigned fail_load_at, fail_cache_at, fail_config_at;
 static unsigned interrupt_cache_at;
 static int interrupt_signal;
+static const char *observed_main_path, *observed_oob_path;
 static volatile sig_atomic_t restored_handler_calls;
 
 static void previous_handler(int signal_number)
@@ -56,11 +59,13 @@ static void reset_mock(unsigned start, unsigned count)
     config = saved_config = 0x15;
     calls = selections = config_writes = page_loads = cache_reads = 0;
     cache_read_bytes = 0;
+    status_polls = busy_responses = busy_per_page = busy_left = 0;
     first_row = start;
     row_count = count;
     loaded_row = 0;
     fail_load_at = fail_cache_at = fail_config_at = interrupt_cache_at = 0;
     interrupt_signal = SIGTERM;
+    observed_main_path = observed_oob_path = NULL;
 }
 
 int programmer_select_chip(bool active)
@@ -68,6 +73,20 @@ int programmer_select_chip(bool active)
     selections++;
     selected = active;
     return 0;
+}
+
+int programmer_transaction(unsigned int write_count, unsigned int read_count,
+    const unsigned char *write_data, unsigned char *read_data)
+{
+    if (programmer_select_chip(true) < 0) {
+        (void)programmer_select_chip(false);
+        return -1;
+    }
+
+    int result = programmer_send_command(write_count, read_count, write_data, read_data);
+    int released = programmer_select_chip(false);
+
+    return result < 0 || released < 0 ? -1 : 0;
 }
 
 int programmer_send_command(unsigned int write_count, unsigned int read_count,
@@ -91,11 +110,17 @@ int programmer_send_command(unsigned int write_count, unsigned int read_count,
              * WEL remains set throughout: the reader must not send WRDI.
              */
             assert(write_data[1] == 0xc0);
+            status_polls++;
             *read_data = 2;
             if (interrupt_busy && page_loads != 0) {
                 interrupt_busy = false;
                 *read_data |= 1;
+                busy_responses++;
                 assert(raise(SIGINT) == 0);
+            } else if (busy_left != 0) {
+                busy_left--;
+                busy_responses++;
+                *read_data |= 1;
             }
         }
         break;
@@ -117,6 +142,7 @@ int programmer_send_command(unsigned int write_count, unsigned int read_count,
         assert(page_loads < row_count && row == first_row + page_loads);
         loaded_row = row;
         page_loads++;
+        busy_left = busy_per_page;
         if (page_loads == fail_load_at) {
             return -1;
         }
@@ -129,6 +155,16 @@ int programmer_send_command(unsigned int write_count, unsigned int read_count,
         assert(page_loads == cache_reads + 1 && !(config & 0x10));
         cache_reads++;
         cache_read_bytes += read_count;
+        if (observed_main_path != NULL && (cache_reads == 2 || cache_reads == BUFFER_PAGES)) {
+            struct stat main_info, oob_info;
+            assert(stat(observed_main_path, &main_info) == 0);
+            assert(stat(observed_oob_path, &oob_info) == 0);
+            /* The first page stays buffered; the 32-page main batch is on
+             * disk before reading page33. OOB remains in its own buffer.
+             */
+            assert(main_info.st_size == (cache_reads == 2 ? 0 : 64 * 1024));
+            assert(oob_info.st_size == 0);
+        }
         if (cache_reads == fail_cache_at) {
             return -1;
         }
@@ -246,6 +282,19 @@ int main(void)
     check_output(output_path, FIRST_ROW, TEST_PAGES);
     assert(unlink(output_path) == 0);
 
+    /* Every page can require several busy polls, not just one ready read.
+     * Count initial + per-page + restoration polls, without sleeping.
+     */
+    reset_mock(FIRST_ROW, TEST_PAGES);
+    busy_per_page = 3;
+    assert(hyf_nand_read_oob(&options) == 0);
+    assert(busy_responses == TEST_PAGES * 3);
+    assert(status_polls == 1 + TEST_PAGES * 4 + 1);
+    assert(page_loads == TEST_PAGES && cache_reads == TEST_PAGES);
+    check_cleanup();
+    check_output(output_path, FIRST_ROW, TEST_PAGES);
+    assert(unlink(output_path) == 0);
+
     /* Length zero resolves to the remainder, including exactly the last
      * page. Already-disabled ECC requires no B0 write at all.
      */
@@ -333,6 +382,52 @@ int main(void)
     check_output(output_path, FIRST_ROW, TEST_PAGES);
     assert(unlink(main_path) == 0 && unlink(output_path) == 0);
 
+    /* Cross the explicit 64-KiB main buffer boundary with only33 generated
+     * pages. Verify the bulk write while capture is still in progress.
+     */
+    options.length = BUFFER_PAGES * MAIN_PAGE;
+    reset_mock(FIRST_ROW, BUFFER_PAGES);
+    paired_mode = true;
+    observed_main_path = main_path;
+    observed_oob_path = output_path;
+    assert(hyf_nand_read(&options) == 0);
+    assert(page_loads == BUFFER_PAGES && cache_reads == BUFFER_PAGES);
+    assert(cache_read_bytes == BUFFER_PAGES * PAGE_BYTES);
+    check_cleanup();
+    check_main_output(main_path, FIRST_ROW, BUFFER_PAGES * MAIN_PAGE);
+    check_output(output_path, FIRST_ROW, BUFFER_PAGES);
+    assert(unlink(main_path) == 0 && unlink(output_path) == 0);
+
+    /* The buffered tail of an interrupted capture is flushed too. Already
+     * captured complete pages survive, but the operation still fails.
+     */
+    reset_mock(FIRST_ROW, BUFFER_PAGES);
+    paired_mode = true;
+    observed_main_path = main_path;
+    observed_oob_path = output_path;
+    interrupt_cache_at = BUFFER_PAGES;
+    assert(hyf_nand_read(&options) != 0);
+    assert(page_loads == BUFFER_PAGES && cache_reads == BUFFER_PAGES);
+    check_cleanup();
+    check_main_output(main_path, FIRST_ROW, BUFFER_PAGES * MAIN_PAGE);
+    check_output(output_path, FIRST_ROW, BUFFER_PAGES);
+    assert(unlink(main_path) == 0 && unlink(output_path) == 0);
+    options.length = TEST_PAGES * MAIN_PAGE;
+
+    /* Also cross the less frequent OOB buffer boundary, with only about
+     * 1 MiB of generated main output, never a full-chip fixture.
+     */
+    options.length = OOB_BUFFER_PAGES * MAIN_PAGE;
+    reset_mock(FIRST_ROW, OOB_BUFFER_PAGES);
+    paired_mode = true;
+    assert(hyf_nand_read(&options) == 0);
+    assert(page_loads == OOB_BUFFER_PAGES && cache_reads == OOB_BUFFER_PAGES);
+    check_cleanup();
+    check_main_output(main_path, FIRST_ROW, OOB_BUFFER_PAGES * MAIN_PAGE);
+    check_output(output_path, FIRST_ROW, OOB_BUFFER_PAGES);
+    assert(unlink(main_path) == 0 && unlink(output_path) == 0);
+    options.length = TEST_PAGES * MAIN_PAGE;
+
     /* The full-chip plan is host-only; no giant fixture or transfer loop. */
     reset_mock(FIRST_ROW, TEST_PAGES);
     options.address = 0;
@@ -414,8 +509,9 @@ int main(void)
     check_output(output_path, FIRST_ROW, 0);
     assert(unlink(main_path) == 0 && unlink(output_path) == 0);
 
-    /* An error during main output can leave a partial main page and no OOB
-     * for that page. Preserve both files; do not label them a complete pair.
+    /* All three pages fit in the host buffers. At cleanup the file limit
+     * permits only128 bytes of EACH bulk output. Preserve these unequal-to-
+     * accepted lengths, flush the other output too, and report failure.
      */
     assert(getrlimit(RLIMIT_FSIZE, &original_limit) == 0);
     file_limit = original_limit;
@@ -427,12 +523,12 @@ int main(void)
     assert(setrlimit(RLIMIT_FSIZE, &file_limit) == 0);
     reset_mock(FIRST_ROW, TEST_PAGES);
     paired_mode = true;
-    assert(hyf_nand_read(&options) != 0 && cache_reads == 1);
+    assert(hyf_nand_read(&options) != 0 && cache_reads == TEST_PAGES);
     assert(setrlimit(RLIMIT_FSIZE, &original_limit) == 0);
     assert(sigaction(SIGXFSZ, &old_file_signal, NULL) == 0);
     check_cleanup();
     check_main_output(main_path, FIRST_ROW, OOB_PAGE);
-    check_output(output_path, FIRST_ROW, 0);
+    check_output(output_path, FIRST_ROW, 1);
     assert(unlink(main_path) == 0 && unlink(output_path) == 0);
 
     /* Permit exactly one extra descriptor: first output opens, second open
@@ -479,8 +575,8 @@ int main(void)
     check_output(output_path, FIRST_ROW, 0);
     assert(unlink(output_path) == 0);
 
-    /* Force a real host write error after one page, without filling a disk
-     * or using a device file. Restore both the resource limit and handler.
+    /* Force a real host bulk-write error: three pages were accepted into
+     * the buffer but only one page fits on disk. Restore limit/handler.
      */
     assert(getrlimit(RLIMIT_FSIZE, &original_limit) == 0);
     file_limit = original_limit;
@@ -491,7 +587,7 @@ int main(void)
     assert(sigaction(SIGXFSZ, &action, &old_file_signal) == 0);
     assert(setrlimit(RLIMIT_FSIZE, &file_limit) == 0);
     reset_mock(FIRST_ROW, TEST_PAGES);
-    assert(hyf_nand_read_oob(&options) != 0 && cache_reads == 2);
+    assert(hyf_nand_read_oob(&options) != 0 && cache_reads == TEST_PAGES);
     assert(setrlimit(RLIMIT_FSIZE, &original_limit) == 0);
     assert(sigaction(SIGXFSZ, &old_file_signal, NULL) == 0);
     check_cleanup();

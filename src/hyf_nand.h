@@ -73,6 +73,11 @@ struct hyf_nand_read_options {
  *
  * The caller initializes the chosen programmer, except for dry_run, which
  * validates the range/new output path without SPI/USB or file creation.
+ * Output is batched in explicit 64-KiB buffers per file, with one page of
+ * cache data; total capture buffers remain below 134 KiB. Ordinary cleanup
+ * flushes captured pages even on interruption. Abrupt termination/power loss
+ * can lose pending host buffers. Reports distinguish accepted bytes from
+ * retained file bytes, and include ready-poll/cache/file-output timing.
  * Interrupted/failed captures retain their partial output and return -1.
  * Returns 0 only after the complete output(s) and ordinary cleanup succeed.
  */

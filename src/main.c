@@ -90,6 +90,8 @@ void usage(void)
 	printf(
 		" -p <name>      SPI programmer: ch341a (default) or ch347\n"
 		" --spi-clock HZ CH347 clock: 60000000 divided by a power of two (default 3750000)\n"
+		" --ch347-mode MODE  normal (default) or dma; DMA supports separate HYF main/OOB modes\n"
+		" --programmer-info  report CH347 adapter/firmware, without issuing NAND commands\n"
 		" --oob FILE     HYF OOB file: -w MAIN restores both; -r MAIN captures both raw\n"
 		" --write-oob FILE  replace OOB while preserving live main data block by block\n"
 		" --read-oob FILE   save raw OOB only to a NEW file; main bytes are not transferred\n"
@@ -127,16 +129,19 @@ int main(int argc, char* argv[])
 	int long long len = 0, addr = 0, flen = 0, wlen = 0;
 	FILE *fp;
 	const char *programmer = "ch341a", *oob_file = NULL, *oob_output = NULL;
+	const char *spi_mode = NULL;
 	int oob_mode = -1; /* Unspecified: metadata, or raw if legacy -d was given. */
 	bool dry_run = false, clock_set = false;
 	unsigned int spi_clock = 0;
 	enum {
 		OPT_OOB = 256, OPT_WRITE_OOB, OPT_OOB_MODE, OPT_DRY_RUN,
-		OPT_SPI_CLOCK, OPT_READ_OOB
+		OPT_SPI_CLOCK, OPT_READ_OOB, OPT_CH347_MODE, OPT_PROGRAMMER_INFO
 	};
 	static const struct option long_options[] = {
 		{"programmer", required_argument, NULL, 'p'},
 		{"spi-clock", required_argument, NULL, OPT_SPI_CLOCK},
+		{"ch347-mode", required_argument, NULL, OPT_CH347_MODE},
+		{"programmer-info", no_argument, NULL, OPT_PROGRAMMER_INFO},
 		{"oob", required_argument, NULL, OPT_OOB},
 		{"write-oob", required_argument, NULL, OPT_WRITE_OOB},
 		{"read-oob", required_argument, NULL, OPT_READ_OOB},
@@ -158,6 +163,12 @@ int main(int argc, char* argv[])
 		{
 			case 'p':
 				programmer = optarg;
+				break;
+			case OPT_CH347_MODE:
+				spi_mode = optarg;
+				break;
+			case OPT_PROGRAMMER_INFO:
+				op = op ? 'x' : 'P';
 				break;
 			case OPT_SPI_CLOCK: {
 				long long value;
@@ -327,7 +338,8 @@ int main(int argc, char* argv[])
 	}
 
 	if (programmer_select(programmer) < 0 ||
-	    (clock_set && programmer_set_spi_clock(spi_clock) < 0))
+	    (clock_set && programmer_set_spi_clock(spi_clock) < 0) ||
+	    (spi_mode && programmer_set_spi_mode(spi_mode) < 0))
 		return 2;
 
 #ifdef EEPROM_SUPPORT
@@ -336,6 +348,34 @@ int main(int argc, char* argv[])
 		return 2;
 	}
 #endif
+
+	if (op == 'P') {
+		if (programmer_is_ch341a() || oob_file || oob_output ||
+		    oob_mode >= 0 || dry_run || vr || addr || len ||
+		    ECC_ignore || !ECC_fcheck || Skip_BAD_page || OOB_size) {
+			fprintf(stderr, "Use --programmer-info with -p ch347 and no flash operation options.\n");
+			return 2;
+		}
+#ifdef EEPROM_SUPPORT
+		if (eepromsize || mw_eepromsize || seepromsize || spage_size) {
+			fprintf(stderr, "Programmer information cannot be combined with EEPROM options.\n");
+			return 2;
+		}
+#endif
+		/* USB configuration/firmware queries only: unlike legacy -i, this
+		 * does not call flash_cmd_init(), identify NAND or unlock flash.
+		 */
+		if (programmer_init() < 0)
+			return 1;
+		return programmer_shutdown() == 0 ? 0 : 1;
+	}
+
+	if (spi_mode && strcmp(spi_mode, "dma") == 0 &&
+	    op != 'R' && !(op == 'r' && oob_file) &&
+	    !(oob_file && (op == 'w' || op == 'O'))) {
+		fprintf(stderr, "DMA requires HYF -r MAIN --oob OOB, --read-oob, -w MAIN --oob OOB or --write-oob.\n");
+		return 2;
+	}
 
 	if (op == 'R' || (op == 'r' && oob_file)) {
 		/* Separate-OOB captures are always raw and exactly physical. A paired

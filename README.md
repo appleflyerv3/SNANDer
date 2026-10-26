@@ -25,6 +25,39 @@ at 30 and 60 MHz produced identical SHA-256 hashes, taking 258 and 220 seconds
 respectively **before the batching changes below**. This is not validation
 of every adapter/wiring setup or of the write paths.
 
+### CH347T normal and DMA modes
+
+`--ch347-mode normal` is the default and keeps the existing manual-CS,
+507-byte USB framing. `--ch347-mode dma` opts into WCH's C2 full-duplex
+automatic-CS protocol, using up to 4093 SPI bytes per USB command. A full
+HYF cache read or program-load fits in one such command. Distinct NAND
+commands remain distinct transactions; page-load/ready checks are not skipped.
+No proprietary WCH library or kernel-driver installation is required.
+
+The DMA protocol requires **CH347T firmware 0x0341 or newer**, following
+WCH's driver compatibility gate; CH347F also supports that path. Firmware is
+queried from the adapter, not guessed from its USB `bcdDevice` revision.
+An unsupported adapter is rejected before any NAND command. Check adapter
+information without issuing NAND commands using:
+
+```sh
+sudo ./src/SNANDer -p ch347 --programmer-info
+```
+
+This configures the adapter's SPI interface and leaves CS inactive; it does
+not probe/unlock the NAND like the inherited `-i` operation. DMA is supported
+only by the separate-file HYF operations: `-r MAIN --oob OOB`, `--read-oob`,
+`-w MAIN --oob OOB` and `--write-oob`. Legacy plain `-r`/`-w`, erase-only,
+EEPROM and `-i` reject a DMA request instead of silently ignoring it.
+Existing ready-status/ID checks must succeed before ECC/protection changes
+or writing. If DMA is unsupported or a capture fails, use normal mode with
+new output names; failed captures are never automatically replayed.
+
+DMA reduces transport overhead for both HYF reads **and writes**, including
+program-load commands and OOB-only preservation reads. It does not reduce
+the NAND's internal erase/program time. Read-back verification still occurs
+only with `-v`; required command acknowledgements/status checks remain.
+
 Use voltage-compatible SPI wiring and a common ground. This software does
 not set adapter supply/IO voltage. Do not use 5 V signals for this NAND or
 power it simultaneously from the programmer and dictionary batteries.
@@ -95,7 +128,7 @@ including parity, and restores the original configuration afterward where
 communication permits. No `-d` is needed, and `--oob-mode` and `-v` are write-only.
 Each NAND page is loaded into its internal cache, then only cache column
 `0x0800` onward is transferred over USB. No erase/program commands or flash
-protection changes occur. Memory use is page-sized, not a full-chip allocation.
+protection changes occur. Memory use is bounded, not a full-chip allocation.
 On interruption/read/output failure, the command returns an error and keeps
 the partial file, reporting how many output bytes were written. Do not treat
 a failed capture as a complete dump.
@@ -112,8 +145,11 @@ sudo ../../SNANDer/src/SNANDer -p ch347 --spi-clock 60000000 \
 
 Each page is loaded once, and all 2176 cache bytes are read in one logical
 SPI transaction. The first 2048 bytes go to the main file and the remaining
-128 to the OOB file. Full-chip output sizes are 256 MiB and 16 MiB. A page-sized
-buffer is streamed to disk; no full-chip RAM allocation is needed.
+128 to the OOB file. Full-chip output sizes are 256 MiB and 16 MiB. One cache
+page and explicit 64-KiB output buffers per file keep capture buffers below
+134 KiB; no full-chip RAM allocation is needed. Pending output is flushed
+during ordinary cleanup, including interruption. Abrupt termination/power loss
+can lose buffered host output; the final report checks retained file lengths.
 
 **ECC is temporarily disabled for this paired capture.** Main bytes therefore
 include any physical bit errors, rather than corrections made by the NAND.
@@ -139,6 +175,43 @@ original ECC-enabled semantics. Required ready checks, chip-select boundaries
 and CH347 acknowledgements are not removed. The paired reader avoids the
 second full traversal previously required by separate main/OOB commands.
 These are software changes, not a measured promise of a particular speedup.
+
+### Bounded read-performance comparison
+
+The reader now polls ready status without the previous fixed 1 ms sleep
+after every busy reply. Interruption, transport errors and the two-second
+busy deadline still stop a failed operation. Writer erase/program waits are
+unchanged. File output is batched into the buffers described above instead
+of making unbuffered writes for each page. Final diagnostics separate ready
+polling, cache transfer and file-output timing, and count busy replies.
+
+The user-provided pre-change CH347T baseline at 60 MHz was **9.080 seconds,
+958.5 KiB/s** for 8 MiB main plus 512 KiB OOB (4096 physical pages). Keep
+`perf_before_main.bin` and `perf_before_oob.bin` for exact comparison.
+From `/home/appleflyer/dict/dumps/bkp1`, run the improved normal mode first:
+
+```sh
+sudo ../../SNANDer/src/SNANDer -p ch347 --spi-clock 60000000 \
+  --ch347-mode normal -a 0 -l 0x800000 \
+  -r perf_after_main.bin --oob perf_after_oob.bin
+cmp perf_before_main.bin perf_after_main.bin
+cmp perf_before_oob.bin perf_after_oob.bin
+```
+
+Then, if the adapter passes the firmware gate, compare DMA mode:
+
+```sh
+sudo ../../SNANDer/src/SNANDer -p ch347 --spi-clock 60000000 \
+  --ch347-mode dma -a 0 -l 0x800000 \
+  -r perf_dma_main.bin --oob perf_dma_oob.bin
+cmp perf_before_main.bin perf_dma_main.bin
+cmp perf_before_oob.bin perf_dma_oob.bin
+```
+
+These captures do not erase/program flash. All outputs must be new files.
+Successful `cmp` is silent. Record the final elapsed-time/statistics lines;
+offline tests alone cannot establish the speedup or hardware compatibility.
+No write-speed benchmark is performed on live firmware.
 
 ### Two OOB modes
 
@@ -209,8 +282,10 @@ Use the new paired-file path for the provided large main/OOB images.
 The CH347 transport adapts the GPL-2.0-or-later
 [flashrom backend](https://github.com/flashrom/flashrom/blob/93546a16f2e096eab3f67a015dc7487f81a25e29/programmers/ch347_spi.c),
 with explicit transaction chip select, bounded frames and strict error handling.
-Configuration/status semantics are also checked against
-[WCH's Linux driver](https://github.com/WCHSoftGroup/ch34x_mphsi_master_linux/blob/main/driver/ch34x_mphsi_master_spi.c).
+Configuration/status and C2 DMA semantics are checked against
+[WCH's Linux driver, pinned at 57be7ed](https://github.com/WCHSoftGroup/ch34x_mphsi_master_linux/blob/57be7ed01e2adb14d34bcca5e1eb71ff6247aba7/driver/ch34x_mphsi_master_spi.c)
+and its
+[firmware query](https://github.com/WCHSoftGroup/ch34x_mphsi_master_linux/blob/57be7ed01e2adb14d34bcca5e1eb71ff6247aba7/driver/ch34x_mphsi_master_usb.c).
 HYF geometry/ECC behavior follows the
 [HYF SPI 2G v2.7 datasheet](https://datasheet.lcsc.com/datasheet/pdf/cb04af556e5204a6f44a4350d72f54c9.pdf?productCode=C7426875).
 Original notices are retained; no proprietary vendor USB library is linked.
@@ -223,7 +298,8 @@ hardware compatibility. **No real chip has been programmed with this new code ye
 make -C src -j1 check
 ```
 
-The checks cover CH347 framing/failures and HYF main/OOB preservation, range
+The checks cover CH347 normal/DMA framing and failures, firmware gating,
+HYF main/OOB preservation, range
 mapping (full-chip files and slices), optional verification, ECC-mode handling
 and failure cleanup, plus raw OOB-only and paired reads with fake programmer calls.
 NAND fixtures use only a few blocks of actual disk/RAM;

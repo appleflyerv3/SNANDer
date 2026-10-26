@@ -60,6 +60,21 @@ int programmer_set_spi_clock(unsigned int hz)
     return ch347_spi_set_clock(hz);
 }
 
+int programmer_set_spi_mode(const char *mode)
+{
+    if (initialized) {
+        fprintf(stderr, "Set the SPI mode before opening the programmer.\n");
+        return -1;
+    }
+
+    if (programmer_is_ch341a()) {
+        fprintf(stderr, "--ch347-mode is supported only by the CH347 backend.\n");
+        return -1;
+    }
+
+    return ch347_spi_set_mode(mode);
+}
+
 int programmer_init(void)
 {
     int result;
@@ -147,6 +162,45 @@ int programmer_send_command(unsigned int writecnt, unsigned int readcnt,
     }
 
     return 0;
+}
+
+int programmer_transaction(unsigned int writecnt, unsigned int readcnt,
+    const unsigned char *writearr, unsigned char *readarr)
+{
+    if (!initialized || failed) {
+        return -1;
+    }
+
+    if ((writecnt != 0 && writearr == NULL) ||
+        (readcnt != 0 && readarr == NULL)) {
+        fprintf(stderr, "SPI transaction has a missing data buffer.\n");
+        failed = true;
+        (void)programmer_select_chip(false);
+        return -1;
+    }
+
+    if (writecnt == 0 && readcnt == 0) {
+        return 0;
+    }
+
+    if (!programmer_is_ch341a()) {
+        if (ch347_spi_transaction(writecnt, readcnt, writearr, readarr) != 0) {
+            failed = true;
+            return -1;
+        }
+
+        return 0;
+    }
+
+    if (programmer_select_chip(true) != 0) {
+        (void)programmer_select_chip(false);
+        return -1;
+    }
+
+    int result = programmer_send_command(writecnt, readcnt, writearr, readarr);
+    int released = programmer_select_chip(false);
+
+    return result == 0 && released == 0 ? 0 : -1;
 }
 
 int programmer_shutdown(void)

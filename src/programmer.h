@@ -16,10 +16,17 @@ bool programmer_is_ch341a(void);
  * ignore a clock request on the CH341 backend.
  */
 int programmer_set_spi_clock(unsigned int hz);
+int programmer_set_spi_mode(const char *mode);
 int programmer_init(void);
 int programmer_shutdown(void);
 int programmer_select_chip(bool active);
 int programmer_send_command(unsigned int writecnt, unsigned int readcnt,
+    const unsigned char *writearr, unsigned char *readarr);
+
+/* Complete command with caller-independent CS ownership. Required for the
+ * opt-in CH347 DMA path; other backends keep ordinary manual-CS behavior.
+ */
+int programmer_transaction(unsigned int writecnt, unsigned int readcnt,
     const unsigned char *writearr, unsigned char *readarr);
 
 /* All results are zero/-1. Shutdown still releases resources after failure

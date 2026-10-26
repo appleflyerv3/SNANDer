@@ -73,15 +73,7 @@ static void request_stop(int signal_number)
 static int transfer(const unsigned char *command, unsigned write_count,
                     unsigned char *result, unsigned read_count)
 {
-    if (programmer_select_chip(true) < 0) {
-        (void)programmer_select_chip(false);
-        return -1;
-    }
-
-    int status = programmer_send_command(write_count, read_count, command, result);
-    int released = programmer_select_chip(false);
-
-    if (status < 0 || released < 0) {
+    if (programmer_transaction(write_count, read_count, command, result) < 0) {
         fprintf(stderr, "HYF SPI transfer/chip-select failed.\n");
         return -1;
     }
@@ -665,9 +657,19 @@ cleanup:
  * commands. Keep this interruptible wait separate from the writer's wait:
  * the writer deliberately finishes a block after its erase has begun.
  */
-static int wait_read_ready(void)
+struct capture_read_stats {
+    uint64_t polls;
+    uint64_t busy_polls;
+    double polling_seconds;
+    double cache_seconds;
+};
+
+static double capture_elapsed(const struct timespec *start);
+
+static int wait_read_ready(struct capture_read_stats *stats, bool interruptible)
 {
     struct timespec start;
+    int result = -1;
 
     if (clock_gettime(CLOCK_MONOTONIC, &start) < 0) {
         perror("CLOCK_MONOTONIC");
@@ -678,32 +680,52 @@ static int wait_read_ready(void)
         unsigned char status = 0;
         struct timespec now;
 
-        if (stop_requested || get_feature(FEATURE_STATUS, &status) < 0) {
-            return -1;
+        if (interruptible && stop_requested) {
+            break;
+        }
+
+        stats->polls++;
+
+        if (get_feature(FEATURE_STATUS, &status) < 0) {
+            break;
         }
 
         if ((status & STATUS_BUSY) == 0) {
-            return 0;
+            result = 0;
+            break;
         }
+
+        stats->busy_polls++;
 
         if (clock_gettime(CLOCK_MONOTONIC, &now) < 0) {
             perror("CLOCK_MONOTONIC");
-            return -1;
+            break;
         }
 
         if (now.tv_sec - start.tv_sec > 2 ||
             (now.tv_sec - start.tv_sec == 2 && now.tv_nsec >= start.tv_nsec)) {
             fprintf(stderr, "HYF read busy timeout (2 seconds, status=%02x).\n", status);
-            return -1;
+            break;
         }
 
-        const struct timespec delay = {0, 1000000};
-
-        (void)nanosleep(&delay, NULL);
+        /* Each status transaction already takes transport time. Poll again
+         * immediately instead of adding an unconditional 1-ms sleep to a
+         * short page load; the stop check and two-second deadline remain.
+         */
     }
+
+    double elapsed = capture_elapsed(&start);
+
+    if (elapsed < 0) {
+        return -1;
+    }
+
+    stats->polling_seconds += elapsed;
+    return result;
 }
 
-static int read_capture_page(uint32_t row, unsigned char *bytes, bool paired)
+static int read_capture_page(uint32_t row, unsigned char *bytes, bool paired,
+                              struct capture_read_stats *stats)
 {
     /* The raw pair must come from ONE cache read of ONE loaded page. OOB
      * alone instead starts at column 0x0800 and never transfers main bytes.
@@ -717,10 +739,30 @@ static int read_capture_page(uint32_t row, unsigned char *bytes, bool paired)
     }
 
     if (stop_requested || row_command(0x13, row) < 0 ||
-        wait_read_ready() < 0 || stop_requested ||
-        transfer(command, sizeof(command), bytes, byte_count) < 0) {
+        wait_read_ready(stats, true) < 0 || stop_requested) {
         fprintf(stderr, "HYF raw read stopped/failed at physical row 0x%05"
                 PRIx32 ".\n", row);
+        return -1;
+    }
+
+    struct timespec started;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &started) < 0) {
+        perror("CLOCK_MONOTONIC");
+        return -1;
+    }
+
+    int result = transfer(command, sizeof(command), bytes, byte_count);
+    double elapsed = capture_elapsed(&started);
+
+    if (elapsed < 0) {
+        return -1;
+    }
+
+    stats->cache_seconds += elapsed;
+
+    if (result < 0) {
+        fprintf(stderr, "HYF raw cache read failed at physical row 0x%05" PRIx32 ".\n", row);
         return -1;
     }
 
@@ -813,7 +855,15 @@ struct capture_output {
     const char *path;
     FILE *stream;
     bool created;
-    uint64_t bytes;
+    bool failed;
+    uint64_t accepted;
+    uint64_t written;
+    double seconds;
+    size_t pending;
+    /* Two output buffers plus the one-page cache stay below 134 KiB.
+     * This is bounded batching, never a full-image allocation.
+     */
+    unsigned char buffer[64 * 1024];
 };
 
 static int open_capture_output(struct capture_output *output)
@@ -838,8 +888,9 @@ static int open_capture_output(struct capture_output *output)
         return -1;
     }
 
-    /* Count actual successful file writes, including a partial last page.
-     * The capture itself is bounded to one page, not a whole image buffer.
+    /* Our explicit buffer below batches pages. Keep stdio unbuffered so a
+     * bulk fwrite's result counts bytes actually handed to the file, not
+     * merely accepted into another hidden buffer.
      */
     if (setvbuf(output->stream, NULL, _IONBF, 0) != 0) {
         fprintf(stderr, "Cannot configure HYF capture stream: %s\n", output->path);
@@ -849,19 +900,63 @@ static int open_capture_output(struct capture_output *output)
     return 0;
 }
 
-static int write_capture_output(struct capture_output *output,
-                                const unsigned char *bytes, size_t count)
+static int append_capture_output(struct capture_output *output,
+                                 const unsigned char *bytes, size_t count)
 {
-    size_t written = fwrite(bytes, 1, count, output->stream);
+    if (output->failed || count > sizeof(output->buffer) - output->pending) {
+        fprintf(stderr, "HYF capture output buffer state invalid: %s\n", output->path);
+        return -1;
+    }
 
-    output->bytes += written;
+    memcpy(output->buffer + output->pending, bytes, count);
+    output->pending += count;
+    output->accepted += count;
+    return 0;
+}
+
+static int flush_capture_output(struct capture_output *output)
+{
+    if (output->failed) {
+        return -1;
+    }
+
+    if (output->pending == 0) {
+        return 0;
+    }
+
+    struct timespec started;
+    bool timed = clock_gettime(CLOCK_MONOTONIC, &started) == 0;
+
+    if (!timed) {
+        perror("CLOCK_MONOTONIC");
+    }
+
+    size_t count = output->pending;
+    size_t written = fwrite(output->buffer, 1, count, output->stream);
+    int write_error = errno;
+
+    output->written += written;
+    output->pending = 0;
+
+    /* Timing failure must not discard data already accepted from the chip. */
+    double elapsed = timed ? capture_elapsed(&started) : -1;
+
+    if (elapsed >= 0) {
+        output->seconds += elapsed;
+    }
 
     if (written != count) {
+        /* Do not retry a failed/short bulk write or pretend its tail was
+         * saved. Accepted versus retained counts keep the loss explicit;
+         * cleanup can still flush the OTHER output's complete pages.
+         */
+        output->failed = true;
+        errno = write_error;
         perror(output->path);
         return -1;
     }
 
-    return 0;
+    return elapsed < 0 ? -1 : 0;
 }
 
 static int close_capture_output(struct capture_output *output)
@@ -869,14 +964,52 @@ static int close_capture_output(struct capture_output *output)
     int result = 0;
 
     if (output->stream != NULL) {
+        /* Even an interrupted read should save its already captured pages.
+         * A previously failed bulk write is not retried, but the other
+         * output remains independently flushable.
+         */
+        if (flush_capture_output(output) < 0) {
+            result = -1;
+        }
+
+        struct timespec started;
+        bool timed = clock_gettime(CLOCK_MONOTONIC, &started) == 0;
+
+        if (!timed) {
+            perror("CLOCK_MONOTONIC");
+            result = -1;
+        }
+
         if (fflush(output->stream) != 0) {
             perror("HYF capture output flush");
+            result = -1;
+        }
+
+        struct stat info;
+
+        if (fstat(fileno(output->stream), &info) < 0 || info.st_size < 0) {
+            perror("HYF capture retained length");
+            result = -1;
+        } else if ((uint64_t)info.st_size != output->written) {
+            fprintf(stderr, "HYF capture file length differs from its write count: %s\n",
+                    output->path);
+            output->written = (uint64_t)info.st_size;
             result = -1;
         }
 
         if (fclose(output->stream) != 0) {
             perror("HYF capture output close");
             result = -1;
+        }
+
+        if (timed) {
+            double elapsed = capture_elapsed(&started);
+
+            if (elapsed < 0) {
+                result = -1;
+            } else {
+                output->seconds += elapsed;
+            }
         }
 
         output->stream = NULL;
@@ -905,6 +1038,7 @@ int hyf_nand_read(const struct hyf_nand_read_options *options)
     bool config_touched = false;
     unsigned char original_config = 0;
     struct capture_output main_output = {0}, oob_output = {0};
+    struct capture_read_stats stats = {0};
     struct timespec started;
     double last_progress = 0;
     int result = -1;
@@ -1001,7 +1135,7 @@ int hyf_nand_read(const struct hyf_nand_read_options *options)
     const unsigned char identify[] = {0x9f, 0};
     unsigned char id[2] = {0};
 
-    if (wait_read_ready() < 0 || stop_requested ||
+    if (wait_read_ready(&stats, true) < 0 || stop_requested ||
         transfer(identify, sizeof(identify), id, sizeof(id)) < 0) {
         goto cleanup;
     }
@@ -1038,21 +1172,41 @@ int hyf_nand_read(const struct hyf_nand_read_options *options)
     for (uint32_t page = 0; page < page_count; page++) {
         unsigned char bytes[PAGE_BYTES];
 
-        if (read_capture_page(first_row + page, bytes, paired) < 0) {
+        if (read_capture_page(first_row + page, bytes, paired, &stats) < 0) {
             goto cleanup;
         }
 
         const unsigned char *spare = bytes;
 
         if (paired) {
-            if (write_capture_output(&main_output, bytes, MAIN_PAGE) < 0) {
+            if (append_capture_output(&main_output, bytes, MAIN_PAGE) < 0) {
                 goto cleanup;
             }
 
             spare = bytes + MAIN_PAGE;
         }
 
-        if (write_capture_output(&oob_output, spare, SPARE_PAGE) < 0) {
+        if (append_capture_output(&oob_output, spare, SPARE_PAGE) < 0) {
+            goto cleanup;
+        }
+
+        /* Accept BOTH parts of this complete cache page before attempting
+         * a full-buffer disk write. If one output fails, cleanup can still
+         * retain the other part rather than silently discard captured OOB.
+         */
+        int flush_result = 0;
+
+        if (paired && main_output.pending == sizeof(main_output.buffer) &&
+            flush_capture_output(&main_output) < 0) {
+            flush_result = -1;
+        }
+
+        if (oob_output.pending == sizeof(oob_output.buffer) &&
+            flush_capture_output(&oob_output) < 0) {
+            flush_result = -1;
+        }
+
+        if (flush_result < 0) {
             goto cleanup;
         }
 
@@ -1063,12 +1217,14 @@ int hyf_nand_read(const struct hyf_nand_read_options *options)
         }
 
         if (elapsed - last_progress >= 1.0 || page + 1 == page_count) {
-            uint64_t total = main_output.bytes + oob_output.bytes;
+            uint64_t total = main_output.accepted + oob_output.accepted;
             double rate = elapsed > 0 ? (double)total / elapsed / 1024.0 : 0;
 
-            printf("RAW: %" PRIu32 "/%" PRIu32 " pages; main %" PRIu64
-                   ", OOB %" PRIu64 " bytes; %.1f s, %.1f KiB/s.\n",
-                   page + 1, page_count, main_output.bytes, oob_output.bytes, elapsed, rate);
+            printf("RAW: %" PRIu32 "/%" PRIu32 " pages; accepted main %" PRIu64
+                   ", OOB %" PRIu64 "; file-written main %" PRIu64 ", OOB %" PRIu64
+                   " bytes; %.1f s, %.1f KiB/s captured.\n", page + 1, page_count,
+                   main_output.accepted, oob_output.accepted,
+                   main_output.written, oob_output.written, elapsed, rate);
             fflush(stdout);
             last_progress = elapsed;
         }
@@ -1080,13 +1236,11 @@ int hyf_nand_read(const struct hyf_nand_read_options *options)
 
 cleanup:
     if (config_touched) {
-        unsigned char status = 0;
-
         /* Read interruption must not suppress restoration. A pending page
-         * load is bounded by the ordinary ready timeout before changing B0.
+         * load is bounded by the read ready timeout before changing B0.
          * No WREN/WRDI or A0 command is part of this read-only path.
          */
-        if (wait_ready(&status) < 0 ||
+        if (wait_read_ready(&stats, false) < 0 ||
             set_feature(FEATURE_CONFIG, original_config) < 0) {
             fprintf(stderr, "Cannot restore original HYF B0; power-cycle before reuse.\n");
             result = -1;
@@ -1098,6 +1252,11 @@ cleanup:
     }
 
     if (close_capture_output(&oob_output) < 0) {
+        result = -1;
+    }
+
+    if (main_output.accepted != main_output.written ||
+        oob_output.accepted != oob_output.written) {
         result = -1;
     }
 
@@ -1125,22 +1284,30 @@ cleanup:
     const char *outcome = result == 0 ? "COMPLETE" : "PARTIAL/ERROR";
 
     if (main_output.created) {
-        printf("%s main capture retained: %" PRIu64 "/%" PRIu64 " bytes in %s.\n",
-               outcome, main_output.bytes, length, main_output.path);
+        printf("%s main capture retained: %" PRIu64 "/%" PRIu64
+               " file bytes; %" PRIu64 " accepted in %s.\n",
+               outcome, main_output.written, length, main_output.accepted, main_output.path);
     }
 
     if (oob_output.created) {
-        printf("%s OOB capture retained: %" PRIu64 "/%" PRIu64 " bytes in %s.\n",
-               outcome, oob_output.bytes, expected_oob, oob_output.path);
+        printf("%s OOB capture retained: %" PRIu64 "/%" PRIu64
+               " file bytes; %" PRIu64 " accepted in %s.\n",
+               outcome, oob_output.written, expected_oob, oob_output.accepted, oob_output.path);
     }
 
     if (elapsed >= 0) {
-        uint64_t total = main_output.bytes + oob_output.bytes;
+        uint64_t total = main_output.written + oob_output.written;
         double rate = elapsed > 0 ? (double)total / elapsed / 1024.0 : 0;
 
         printf("Raw capture elapsed %.3f s; %" PRIu64 " total bytes, %.1f KiB/s.\n",
                elapsed, total, rate);
     }
+
+    printf("Read polling: %" PRIu64 " status polls, %" PRIu64
+           " busy, %.6f s; intentional polling sleeps: 0.\n",
+           stats.polls, stats.busy_polls, stats.polling_seconds);
+    printf("Read timing: cache transfers %.6f s; bulk file output/close %.6f s.\n",
+           stats.cache_seconds, main_output.seconds + oob_output.seconds);
 
     return result;
 }
