@@ -96,6 +96,7 @@ void usage(void)
 		" --write-oob FILE  replace OOB while preserving live main data block by block\n"
 		" --read-oob FILE   save raw OOB only to a NEW file; main bytes are not transferred\n"
 		" --oob-mode MODE   writes only: metadata (default, regenerate ECC) or raw\n"
+		" --skip-bad-blocks HYF OOB writes: skip reported erase/program failures; no remap\n"
 		" --dry-run      check HYF paths/range and print plan without opening USB\n"
 		" HYF -a/-l use physical MAIN-byte addresses: reads align to 2048-byte pages;\n"
 		" writes align to 128 KiB blocks. Post-write read-back occurs only with -v.\n");
@@ -131,11 +132,12 @@ int main(int argc, char* argv[])
 	const char *programmer = "ch341a", *oob_file = NULL, *oob_output = NULL;
 	const char *spi_mode = NULL;
 	int oob_mode = -1; /* Unspecified: metadata, or raw if legacy -d was given. */
-	bool dry_run = false, clock_set = false;
+	bool dry_run = false, clock_set = false, skip_bad_blocks = false;
 	unsigned int spi_clock = 0;
 	enum {
 		OPT_OOB = 256, OPT_WRITE_OOB, OPT_OOB_MODE, OPT_DRY_RUN,
-		OPT_SPI_CLOCK, OPT_READ_OOB, OPT_CH347_MODE, OPT_PROGRAMMER_INFO
+		OPT_SPI_CLOCK, OPT_READ_OOB, OPT_CH347_MODE, OPT_PROGRAMMER_INFO,
+		OPT_SKIP_BAD_BLOCKS
 	};
 	static const struct option long_options[] = {
 		{"programmer", required_argument, NULL, 'p'},
@@ -147,6 +149,7 @@ int main(int argc, char* argv[])
 		{"read-oob", required_argument, NULL, OPT_READ_OOB},
 		{"oob-mode", required_argument, NULL, OPT_OOB_MODE},
 		{"dry-run", no_argument, NULL, OPT_DRY_RUN},
+		{"skip-bad-blocks", no_argument, NULL, OPT_SKIP_BAD_BLOCKS},
 		{"help", no_argument, NULL, 'h'},
 		{NULL, 0, NULL, 0}
 	};
@@ -213,6 +216,9 @@ int main(int argc, char* argv[])
 				break;
 			case OPT_DRY_RUN:
 				dry_run = true;
+				break;
+			case OPT_SKIP_BAD_BLOCKS:
+				skip_bad_blocks = true;
 				break;
 #ifdef EEPROM_SUPPORT
 			case 'E':
@@ -337,6 +343,11 @@ int main(int argc, char* argv[])
 		return -1;
 	}
 
+	if (skip_bad_blocks && (!oob_file || (op != 'w' && op != 'O'))) {
+		fprintf(stderr, "--skip-bad-blocks requires -w MAIN --oob OOB or --write-oob OOB.\n");
+		return 2;
+	}
+
 	if (programmer_select(programmer) < 0 ||
 	    (clock_set && programmer_set_spi_clock(spi_clock) < 0) ||
 	    (spi_mode && programmer_set_spi_mode(spi_mode) < 0))
@@ -429,6 +440,7 @@ int main(int argc, char* argv[])
 			.raw = oob_mode == 1 || (oob_mode < 0 && !ECC_fcheck),
 			.verify = vr != 0,
 			.dry_run = dry_run,
+			.skip_bad_blocks = skip_bad_blocks,
 		};
 		if (op == 'w')
 			options.main_path = fname;

@@ -59,6 +59,15 @@ struct workspace {
     unsigned char readback[PAGE_BYTES];
 };
 
+/* A completed NAND rejection/failure is different from uncertain transport
+ * or protocol state. Only the former may be skipped by an explicit request.
+ */
+enum block_result {
+    BLOCK_ERROR = -1,
+    BLOCK_OK = 0,
+    BLOCK_DEVICE_FAILURE = 1,
+};
+
 /* A command-line operation owns the programmer exclusively. Interrupts may
  * stop before the next erase, but never intentionally abandon a block just
  * erased while its complete replacement is already resident in workspace.
@@ -240,22 +249,34 @@ static int preserve_main(struct workspace *work, uint32_t first_row, bool raw)
     return 0;
 }
 
-static int erase_block(uint32_t first_row)
+static enum block_result erase_block(uint32_t first_row)
 {
     unsigned char status = 0;
 
     if (write_enable() < 0 || row_command(0xd8, first_row) < 0 ||
-        wait_ready(&status) < 0 ||
-        (status & STATUS_ERASE_FAIL) != 0) {
+        wait_ready(&status) < 0) {
         fprintf(stderr, "HYF erase failed/uncertain at block %u (status=%02x).\n",
                 first_row / PAGES_PER_BLOCK, status);
-        return -1;
+        return BLOCK_ERROR;
     }
 
-    return 0;
+    if ((status & STATUS_ERASE_FAIL) != 0) {
+        fprintf(stderr, "HYF NAND reported erase failure at block %u (status=%02x).\n",
+                first_row / PAGES_PER_BLOCK, status);
+        return BLOCK_DEVICE_FAILURE;
+    }
+
+    if ((status & STATUS_WEL) != 0) {
+        fprintf(stderr, "HYF erase left WEL set without E_FAIL at block %u"
+                " (status=%02x); protocol state uncertain.\n",
+                first_row / PAGES_PER_BLOCK, status);
+        return BLOCK_ERROR;
+    }
+
+    return BLOCK_OK;
 }
 
-static int program_block(struct workspace *work, uint32_t first_row, bool raw)
+static enum block_result program_block(struct workspace *work, uint32_t first_row, bool raw)
 {
     work->command[0] = 0x02;
     work->command[1] = 0;
@@ -284,13 +305,53 @@ static int program_block(struct workspace *work, uint32_t first_row, bool raw)
          */
         if (write_enable() < 0 ||
             transfer(work->command, sizeof(work->command), NULL, 0) < 0 ||
-            row_command(0x10, first_row + page) < 0 || wait_ready(&status) < 0 ||
-            (status & (STATUS_PROGRAM_FAIL | STATUS_WEL)) != 0) {
+            row_command(0x10, first_row + page) < 0 || wait_ready(&status) < 0) {
             fprintf(stderr, "HYF program failed/uncertain at row 0x%05" PRIx32
                     " (status=%02x). No remap/retry performed.\n",
                     first_row + page, status);
-            return -1;
+            return BLOCK_ERROR;
         }
+
+        if ((status & STATUS_PROGRAM_FAIL) != 0) {
+            fprintf(stderr, "HYF NAND reported program failure at row 0x%05" PRIx32
+                    " (status=%02x).\n", first_row + page, status);
+            return BLOCK_DEVICE_FAILURE;
+        }
+
+        if ((status & STATUS_WEL) != 0) {
+            fprintf(stderr, "HYF program left WEL set without P_FAIL at row 0x%05"
+                    PRIx32 " (status=%02x); protocol state uncertain.\n",
+                    first_row + page, status);
+            return BLOCK_ERROR;
+        }
+    }
+
+    return BLOCK_OK;
+}
+
+/* This does not fix or reset a failed block. It establishes that proceeding
+ * to a DIFFERENT block will still use the intended unlocked/configured NAND.
+ * Failure bits may stay set until their next corresponding command; do not
+ * mistake a previous P_FAIL for an erase failure, or vice versa.
+ */
+static int prepare_after_skipped_block(unsigned char expected_lock,
+                                       unsigned char expected_config)
+{
+    unsigned char status = 0, lock = 0, config = 0;
+
+    if (write_disable() < 0 || get_feature(FEATURE_STATUS, &status) < 0 ||
+        get_feature(FEATURE_LOCK, &lock) < 0 ||
+        get_feature(FEATURE_CONFIG, &config) < 0) {
+        fprintf(stderr, "Cannot establish safe NAND state after failed block; stopping.\n");
+        return -1;
+    }
+
+    if ((status & (STATUS_BUSY | STATUS_WEL)) != 0 ||
+        lock != expected_lock || config != expected_config) {
+        fprintf(stderr, "NAND state changed after failed block: A0=%02x B0=%02x"
+                " C0=%02x; expected A0=%02x B0=%02x and ready/WEL clear. Stopping.\n",
+                lock, config, status, expected_lock, expected_config);
+        return -1;
     }
 
     return 0;
@@ -400,7 +461,7 @@ int hyf_nand_write(const struct hyf_nand_options *options)
     bool identified = false, config_touched = false, lock_touched = false;
     bool destructive_started = false, current_block_incomplete = false;
     unsigned char original_config = 0, original_lock = 0;
-    uint64_t current_block = 0, completed = 0;
+    uint64_t current_block = 0, completed = 0, skipped = 0;
     int result = -1;
 
     stop_requested = 0;
@@ -454,6 +515,11 @@ int hyf_nand_write(const struct hyf_nand_options *options)
         puts("Verification: enabled (-v), page readback after each programmed block.");
     } else {
         puts("Verification: disabled; no readback. Status/configuration checks remain enabled.");
+    }
+
+    if (options->skip_bad_blocks) {
+        puts("Skip policy: reported NAND erase/program failures only; physical offsets"
+             " unchanged. Skipped blocks are NOT restored or verified.");
     }
 
     if (options->dry_run) {
@@ -531,8 +597,9 @@ int hyf_nand_write(const struct hyf_nand_options *options)
     }
 
     lock_touched = true;
+    unsigned char desired_lock = original_lock & (unsigned char)~LOCK_BP_MASK;
 
-    if (set_feature(FEATURE_LOCK, original_lock & (unsigned char)~LOCK_BP_MASK) < 0) {
+    if (set_feature(FEATURE_LOCK, desired_lock) < 0) {
         goto cleanup;
     }
 
@@ -567,7 +634,29 @@ int hyf_nand_write(const struct hyf_nand_options *options)
         destructive_started = true;
         current_block_incomplete = true;
 
-        if (erase_block(first_row) < 0 || program_block(work, first_row, options->raw) < 0) {
+        const char *failed_operation = "erase";
+        enum block_result block_result = erase_block(first_row);
+
+        if (block_result == BLOCK_OK) {
+            failed_operation = "program";
+            block_result = program_block(work, first_row, options->raw);
+        }
+
+        if (block_result == BLOCK_DEVICE_FAILURE && options->skip_bad_blocks) {
+            if (prepare_after_skipped_block(desired_lock, desired_config) < 0) {
+                goto cleanup;
+            }
+
+            skipped++;
+            current_block_incomplete = false;
+            fprintf(stderr, "SKIPPED physical block %u at 0x%08" PRIx64
+                    " after NAND %s failure; not restored/verified, may be partial."
+                    " No retry/remap; next input keeps its physical offset.\n",
+                    first_row / PAGES_PER_BLOCK, current_block, failed_operation);
+            continue;
+        }
+
+        if (block_result != BLOCK_OK) {
             goto cleanup;
         }
 
@@ -578,7 +667,7 @@ int hyf_nand_write(const struct hyf_nand_options *options)
         completed++;
         current_block_incomplete = false;
         printf("Block %" PRIu64 "/%" PRIu64 " programmed at 0x%08" PRIx64,
-               completed, length / MAIN_BLOCK, current_block);
+               completed + skipped, length / MAIN_BLOCK, current_block);
 
         if (options->verify) {
             printf("; verified");
@@ -640,14 +729,26 @@ cleanup:
         result = -1;
     }
 
+    if (options->skip_bad_blocks && !options->dry_run) {
+        printf("HYF write summary: %" PRIu64 " programmed, %" PRIu64
+               " skipped, %" PRIu64 " requested blocks; %s.\n",
+               completed, skipped, length / MAIN_BLOCK,
+               result == 0 ? "range processed" : "stopped with error");
+        if (skipped != 0) {
+            puts("INCOMPLETE RESTORATION: skipped blocks were not restored/verified;"
+                 " no data was relocated.");
+        }
+    }
+
     if (result != 0 && destructive_started) {
         if (current_block_incomplete) {
             fprintf(stderr, "WARNING: block at 0x%08" PRIx64
                     " may be erased/partial or unverified.\n", current_block);
         }
 
-        fprintf(stderr, "%" PRIu64 " block(s) completed before failure/interruption/cleanup;"
-                " no automatic recovery.\n", completed);
+        fprintf(stderr, "%" PRIu64 " block(s) programmed, %" PRIu64
+                " skipped before failure/interruption/cleanup; no automatic recovery.\n",
+                completed, skipped);
     }
 
     return result;

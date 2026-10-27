@@ -26,8 +26,13 @@ static unsigned char saved_config, saved_protection;
 static bool selected, metadata_loads_masked;
 static unsigned calls, page_reads, cache_reads, erase_calls, execute_calls;
 static unsigned reads_before_first_erase, selected_row;
-static unsigned fail_program_at, read_ecc_status;
+static unsigned fail_erase_at, fail_program_at, read_ecc_status;
+static unsigned fail_erase_transport_at, fail_program_transport_at;
+static unsigned char erase_failure_status, program_failure_status;
 static bool wrong_id, fail_erase, corrupt_readback;
+static bool change_config_on_failure, change_protection_on_failure;
+static bool failure_pending, failure_disabled, failure_ready_checked;
+static bool failure_config_checked, failure_protection_checked;
 
 static unsigned char input_main(unsigned page, unsigned offset)
 {
@@ -58,8 +63,14 @@ static void reset_mock(void)
     metadata_loads_masked = true;
     calls = page_reads = cache_reads = erase_calls = execute_calls = 0;
     reads_before_first_erase = selected_row = 0;
-    fail_program_at = read_ecc_status = 0;
+    fail_erase_at = fail_program_at = read_ecc_status = 0;
+    fail_erase_transport_at = fail_program_transport_at = 0;
+    erase_failure_status = 4;
+    program_failure_status = 8;
     wrong_id = fail_erase = corrupt_readback = false;
+    change_config_on_failure = change_protection_on_failure = false;
+    failure_pending = failure_disabled = failure_ready_checked = false;
+    failure_config_checked = failure_protection_checked = false;
 
     for (unsigned page = 0; page < 2 * PAGES; page++) {
         for (unsigned i = 0; i < MAIN_PAGE; i++) {
@@ -67,6 +78,20 @@ static void reset_mock(void)
         }
 
         memset(flash[page] + MAIN_PAGE, 0xff, OOB_PAGE);
+    }
+}
+
+static void record_chip_failure(void)
+{
+    failure_pending = true;
+    failure_disabled = failure_ready_checked = false;
+    failure_config_checked = failure_protection_checked = false;
+
+    if (change_config_on_failure) {
+        config ^= 0x10;
+    }
+    if (change_protection_on_failure) {
+        protection |= 0x08;
     }
 }
 
@@ -110,11 +135,20 @@ int programmer_send_command(unsigned int write_count, unsigned int read_count,
         assert(write_count == 2 && read_count == 1);
         if (write_data[1] == 0xa0) {
             *read_data = protection;
+            if (failure_pending) {
+                failure_protection_checked = true;
+            }
         } else if (write_data[1] == 0xb0) {
             *read_data = config;
+            if (failure_pending) {
+                failure_config_checked = true;
+            }
         } else {
             assert(write_data[1] == 0xc0);
             *read_data = status;
+            if (failure_pending && failure_disabled && (status & 3) == 0) {
+                failure_ready_checked = true;
+            }
         }
         break;
     case 0x1f:
@@ -133,18 +167,33 @@ int programmer_send_command(unsigned int write_count, unsigned int read_count,
     case 0x04:
         assert(write_count == 1 && read_count == 0);
         status &= (unsigned char)~2;
+        if (failure_pending) {
+            failure_disabled = true;
+        }
         break;
     case 0xd8: {
         assert(write_count == 4 && read_count == 0 && (status & 2));
         unsigned row = (unsigned)write_data[1] << 16 |
             (unsigned)write_data[2] << 8 | write_data[3];
         assert(row >= BASE_ROW && row < BASE_ROW + 2 * PAGES && row % PAGES == 0);
+        if (failure_pending) {
+            /* A failed physical block may be abandoned only after recovery,
+             * not by blindly carrying its WEL/configuration into the next.
+             */
+            assert(failure_disabled && failure_ready_checked);
+            assert(failure_config_checked && failure_protection_checked);
+            failure_pending = false;
+        }
         if (erase_calls == 0) {
             reads_before_first_erase = page_reads;
         }
         erase_calls++;
-        if (fail_erase) {
-            status = 4;
+        if (fail_erase_transport_at != 0 && erase_calls == fail_erase_transport_at) {
+            return -1;
+        }
+        if (fail_erase || (fail_erase_at != 0 && erase_calls == fail_erase_at)) {
+            status = erase_failure_status;
+            record_chip_failure();
             break;
         }
         memset(flash[row - BASE_ROW], 0xff, PAGES * PAGE_BYTES);
@@ -169,9 +218,13 @@ int programmer_send_command(unsigned int write_count, unsigned int read_count,
             (unsigned)write_data[2] << 8 | write_data[3];
         assert(row >= BASE_ROW && row < BASE_ROW + 2 * PAGES);
         execute_calls++;
+        if (fail_program_transport_at != 0 && execute_calls == fail_program_transport_at) {
+            return -1;
+        }
         status = 0;
         if (fail_program_at != 0 && execute_calls == fail_program_at) {
-            status = 8;
+            status = program_failure_status;
+            record_chip_failure();
             break;
         }
         memcpy(flash[row - BASE_ROW], cache, PAGE_BYTES);
@@ -216,9 +269,10 @@ static void check_cleanup(void)
     assert(config == saved_config && protection == saved_protection);
 }
 
-static void check_contents(bool raw, bool preserve)
+static void check_block_contents(unsigned block, bool raw, bool preserve)
 {
-    for (unsigned page = 0; page < PAGES; page++) {
+    assert(block < 2);
+    for (unsigned page = block * PAGES; page < (block + 1) * PAGES; page++) {
         for (unsigned i = 0; i < MAIN_PAGE; i++) {
             unsigned char expected = input_main(page, i);
             if (preserve) {
@@ -234,9 +288,12 @@ static void check_contents(bool raw, bool preserve)
             assert(flash[page][MAIN_PAGE + i] == expected);
         }
     }
+}
 
-    /* A one-block request must leave its adjacent physical block untouched. */
-    for (unsigned page = PAGES; page < 2 * PAGES; page++) {
+static void check_untouched_block(unsigned block)
+{
+    assert(block < 2);
+    for (unsigned page = block * PAGES; page < (block + 1) * PAGES; page++) {
         for (unsigned i = 0; i < MAIN_PAGE; i++) {
             assert(flash[page][i] == live_main(page, i));
         }
@@ -246,31 +303,210 @@ static void check_contents(bool raw, bool preserve)
     }
 }
 
+static void check_contents(bool raw, bool preserve)
+{
+    check_block_contents(0, raw, preserve);
+    /* A one-block request must leave its adjacent physical block untouched. */
+    check_untouched_block(1);
+}
+
 static void path_in(char *path, size_t capacity, const char *directory, const char *name)
 {
     int length = snprintf(path, capacity, "%s/%s", directory, name);
     assert(length > 0 && (size_t)length < capacity);
 }
 
-/* Sparse full-chip fixtures exercise physical seeks without allocating or
- * writing a full-chip buffer. Only the selected block contains our pattern;
- * accidentally reading file offset zero will fail the content assertions.
+/* Sparse full-chip fixtures exercise physical seeks without a full-chip
+ * buffer. Slice fixtures start at file offset zero. Each physical block has
+ * a distinct page pattern, so skipping cannot accidentally compact inputs.
  */
-static void make_full_input(const char *path, bool main_area)
+static void make_input(const char *path, bool main_area, bool full_chip, unsigned blocks)
 {
     unsigned char bytes[MAIN_PAGE];
     unsigned page_bytes = main_area ? MAIN_PAGE : OOB_PAGE;
     FILE *stream = fopen(path, "wb");
     assert(stream != NULL);
-    assert(ftruncate(fileno(stream), (off_t)2048 * PAGES * page_bytes) == 0);
-    assert(fseeko(stream, (off_t)BASE_BLOCK * PAGES * page_bytes, SEEK_SET) == 0);
-    for (unsigned page = 0; page < PAGES; page++) {
+    assert(blocks != 0 && blocks <= 2);
+    if (full_chip) {
+        assert(ftruncate(fileno(stream), (off_t)2048 * PAGES * page_bytes) == 0);
+        assert(fseeko(stream, (off_t)BASE_BLOCK * PAGES * page_bytes, SEEK_SET) == 0);
+    }
+    for (unsigned page = 0; page < blocks * PAGES; page++) {
         for (unsigned i = 0; i < page_bytes; i++) {
             bytes[i] = main_area ? input_main(page, i) : input_oob(page, i);
         }
         assert(fwrite(bytes, 1, page_bytes, stream) == page_bytes);
     }
     assert(fclose(stream) == 0);
+}
+
+static void check_skip_bad_blocks(const char *main_path, const char *oob_path)
+{
+    struct hyf_nand_options options = {
+        .main_path = main_path, .oob_path = oob_path,
+        .address = (uint64_t)BASE_BLOCK * MAIN_BLOCK, .length = 2 * MAIN_BLOCK,
+        .skip_bad_blocks = true,
+    };
+
+    for (unsigned full_chip = 0; full_chip < 2; full_chip++) {
+        make_input(main_path, true, full_chip != 0, 2);
+        make_input(oob_path, false, full_chip != 0, 2);
+        options.main_path = main_path;
+        options.raw = false;
+        options.verify = false;
+
+        reset_mock();
+        fail_erase_at = 1;
+        assert(hyf_nand_write(&options) == 0);
+        assert(erase_calls == 2 && execute_calls == PAGES);
+        assert(page_reads == 0 && cache_reads == 0 && metadata_loads_masked);
+        check_untouched_block(0);
+        check_block_contents(1, false, false);
+        check_cleanup();
+
+        /* E_FAIL with WEL still set is recoverable too. Only the successfully
+         * programmed second block receives optional verification reads.
+         */
+        reset_mock();
+        options.raw = true;
+        options.verify = true;
+        fail_erase_at = 1;
+        erase_failure_status = 6;
+        assert(hyf_nand_write(&options) == 0);
+        assert(erase_calls == 2 && execute_calls == PAGES);
+        assert(page_reads == PAGES && cache_reads == PAGES);
+        check_untouched_block(0);
+        check_block_contents(1, true, false);
+        check_cleanup();
+
+        reset_mock();
+        options.raw = false;
+        options.verify = false;
+        fail_program_at = 4;
+        assert(hyf_nand_write(&options) == 0);
+        assert(erase_calls == 2 && execute_calls == PAGES + 4);
+        assert(page_reads == 0 && cache_reads == 0);
+        check_block_contents(1, false, false);
+        check_cleanup();
+
+        /* OOB-only writes must preserve each block's own main area. These
+         * 128 reads are preservation, not a marker scan or verification.
+         */
+        reset_mock();
+        options.main_path = NULL;
+        fail_erase_at = 1;
+        assert(hyf_nand_write(&options) == 0);
+        assert(erase_calls == 2 && execute_calls == PAGES);
+        assert(page_reads == 2 * PAGES && cache_reads == 2 * PAGES);
+        assert(reads_before_first_erase == PAGES);
+        check_untouched_block(0);
+        check_block_contents(1, false, true);
+        check_cleanup();
+
+        reset_mock();
+        options.raw = true;
+        fail_program_at = 4;
+        assert(hyf_nand_write(&options) == 0);
+        assert(erase_calls == 2 && execute_calls == PAGES + 4);
+        assert(page_reads == 2 * PAGES && cache_reads == 2 * PAGES);
+        check_block_contents(1, true, true);
+        check_cleanup();
+    }
+
+    /* The final loop left sparse full-chip inputs, valid for either selected
+     * length. Even a one-block request with no programmed blocks can complete
+     * with a reported skip, while the default remains fail-fast.
+     */
+    options.main_path = main_path;
+    options.raw = false;
+    options.length = MAIN_BLOCK;
+    reset_mock();
+    fail_erase_at = 1;
+    erase_failure_status = 6;
+    assert(hyf_nand_write(&options) == 0);
+    assert(erase_calls == 1 && execute_calls == 0 && page_reads == 0);
+    check_untouched_block(0);
+    check_untouched_block(1);
+    check_cleanup();
+
+    reset_mock();
+    fail_program_at = 4;
+    assert(hyf_nand_write(&options) == 0);
+    assert(erase_calls == 1 && execute_calls == 4 && page_reads == 0);
+    check_untouched_block(1);
+    check_cleanup();
+
+    options.length = 2 * MAIN_BLOCK;
+    options.skip_bad_blocks = false;
+    reset_mock();
+    fail_erase_at = 1;
+    assert(hyf_nand_write(&options) != 0);
+    assert(erase_calls == 1 && execute_calls == 0 && page_reads == 0);
+    check_untouched_block(1);
+    check_cleanup();
+
+    reset_mock();
+    fail_program_at = 4;
+    assert(hyf_nand_write(&options) != 0);
+    assert(erase_calls == 1 && execute_calls == 4 && page_reads == 0);
+    check_untouched_block(1);
+    check_cleanup();
+
+    /* Neither an uncertain SPI result nor a later verification mismatch is
+     * a completed NAND E_FAIL/P_FAIL, even with skipping explicitly enabled.
+     */
+    options.skip_bad_blocks = true;
+    reset_mock();
+    fail_erase_transport_at = 1;
+    assert(hyf_nand_write(&options) != 0);
+    assert(erase_calls == 1 && execute_calls == 0 && page_reads == 0);
+    check_untouched_block(1);
+    check_cleanup();
+
+    reset_mock();
+    fail_program_transport_at = 4;
+    assert(hyf_nand_write(&options) != 0);
+    assert(erase_calls == 1 && execute_calls == 4 && page_reads == 0);
+    check_untouched_block(1);
+    check_cleanup();
+
+    reset_mock();
+    options.verify = true;
+    corrupt_readback = true;
+    assert(hyf_nand_write(&options) != 0);
+    assert(erase_calls == 1 && execute_calls == PAGES);
+    assert(page_reads == 1 && cache_reads == 1);
+    check_untouched_block(1);
+    check_cleanup();
+    options.verify = false;
+
+    for (unsigned changed_feature = 0; changed_feature < 2; changed_feature++) {
+        reset_mock();
+        fail_erase_at = 1;
+        change_config_on_failure = changed_feature == 0;
+        change_protection_on_failure = changed_feature == 1;
+        assert(hyf_nand_write(&options) != 0);
+        assert(erase_calls == 1 && execute_calls == 0 && page_reads == 0);
+        check_untouched_block(1);
+        check_cleanup();
+    }
+
+    /* WEL by itself is not a chip-declared failure that permits a skip. */
+    reset_mock();
+    fail_erase_at = 1;
+    erase_failure_status = 2;
+    assert(hyf_nand_write(&options) != 0);
+    assert(erase_calls == 1 && execute_calls == 0 && page_reads == 0);
+    check_untouched_block(1);
+    check_cleanup();
+
+    reset_mock();
+    fail_program_at = 4;
+    program_failure_status = 2;
+    assert(hyf_nand_write(&options) != 0);
+    assert(erase_calls == 1 && execute_calls == 4 && page_reads == 0);
+    check_untouched_block(1);
+    check_cleanup();
 }
 
 int main(void)
@@ -383,19 +619,21 @@ int main(void)
     assert(hyf_nand_write(&options) == 0 && calls == 0);
     options.dry_run = false;
 
-    make_full_input(main_path, true);
+    make_input(main_path, true, true, 1);
     reset_mock();
     assert(hyf_nand_write(&options) == 0);
     assert(page_reads == 0 && erase_calls == 1 && execute_calls == PAGES);
     check_contents(false, false); /* full main, independently mapped OOB slice */
     check_cleanup();
 
-    make_full_input(oob_path, false);
+    make_input(oob_path, false, true, 1);
     reset_mock();
     assert(hyf_nand_write(&options) == 0);
     assert(page_reads == 0 && erase_calls == 1 && execute_calls == PAGES);
     check_contents(false, false); /* both full-chip inputs seek to block 263 */
     check_cleanup();
+
+    check_skip_bad_blocks(main_path, oob_path);
 
     reset_mock();
     options.address = (uint64_t)MAIN_BLOCK * 2047;

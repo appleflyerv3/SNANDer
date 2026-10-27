@@ -24,6 +24,11 @@ struct hyf_nand_options {
     bool raw;
     bool verify;
     bool dry_run;
+    /* Continue after a ready-completed NAND erase/program failure, without
+     * retrying or moving that block's input data to another physical block.
+     * Transport/protocol/preservation/readback errors still abort.
+     */
+    bool skip_bad_blocks;
 };
 
 /* Exact-physical same-device HYF2GQ4UAACAE writer, not a bad-block mapper.
@@ -31,7 +36,9 @@ struct hyf_nand_options {
  * zero-valued tags occur on a block successfully programmed by the existing
  * tool. They cannot safely be reinterpreted as generic factory bad markers.
  * No marker scan, remap, shifted file mapping or automatic retry is done.
- * Program/erase failure status aborts instead of choosing a different block.
+ * Program/erase failure status aborts by default. With skip_bad_blocks, an
+ * explicit chip failure skips that block after ready/WEL/config checks;
+ * the next block still uses its own original physical input coordinates.
  *
  * Each input must be a regular full-chip file or an exact selected-range
  * slice: main256MiB or selected length, OOB16MiB or selected length/16.
@@ -44,7 +51,9 @@ struct hyf_nand_options {
  * OOB-only main preservation and ID/status/configuration checks are required
  * independently of verification. A0/B0 and signal handlers are restored on
  * ordinary cleanup, and WEL is cleared. Never disconnect power during writes.
- * Returns0 on success, -1 on failure; no backups or output files are created.
+ * Returns0 when the range finishes under the selected policy, including
+ * explicitly reported skips (NOT a complete restoration), -1 on failure.
+ * No backups or output files are created.
  */
 int hyf_nand_write(const struct hyf_nand_options *options);
 

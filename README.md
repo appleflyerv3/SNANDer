@@ -334,9 +334,57 @@ Writes use about 142 KiB of block/page buffers, not a full-chip allocation.
 Both files' bytes for a block are buffered before erasing it. SIGINT/SIGTERM
 requests stop before the next erase; a block already being rewritten is
 completed first if transport remains functional. Power loss, SIGKILL or a USB
-failure can still leave an erased/partial block. Failures stop without retries
-or relocation and return an error. Original protection/ECC configuration is
+failure can still leave an erased/partial block. Failures stop by default,
+without retries or relocation, and return an error. Original protection/ECC configuration is
 restored on cleanup where communication permits.
+
+### Optional skipping of chip-reported bad/failed blocks
+
+`--skip-bad-blocks` applies to the HYF `-w MAIN --oob OOB` and `--write-oob OOB`
+writers only. It is not the inherited `-k` option and cannot be combined with
+it. Reads, standalone `-e`, and legacy main-only writes reject the new flag.
+
+For example, to resume a matching main/OOB restoration at physical block 128:
+
+```sh
+cd /home/appleflyer/dict
+sudo ./SNANDer/src/SNANDer -p ch347 --spi-clock 7500000 \
+  --ch347-mode normal -a 0x01000000 \
+  -w dumps/original/hyf2gq4_dump.bin \
+  --oob dumps/original/hyf2gq4_oob.bin --oob-mode raw \
+  --skip-bad-blocks
+```
+
+There is no `-l` in this example: it processes the remainder of the chip, not
+just one block. Add `-l 0x40000` to limit it to blocks 128 and 129. These are
+real erase/program commands, not diagnostics. Keep stable power. Verification
+remains optional: add `-v` to check each successfully programmed block.
+
+The writer attempts each physical block once. If a completed ready poll
+reports E_FAIL for erase or P_FAIL for program, the option permits that block
+to be skipped. Before continuing, WEL must clear and A0/B0 must still match
+the intended unlocked/ECC configuration. No reset, automatic retry, bad-block
+marker rewrite or remapping is performed. A program failure can leave a
+partially programmed block; even an erase failure does not guarantee the
+block is unchanged. The output reports the physical address and failure type.
+
+**Physical coordinates never shift:** skipping block 128 discards only that
+block's input slice; block 129 still receives block 129's original main/OOB
+bytes. This supports exact-physical same-device image restoration, not moving
+a logical image around bad blocks on a replacement NAND. It does not recover
+data belonging to skipped blocks or guarantee a bootable device.
+
+There is deliberately no generic zero-OOB marker scan: OEM metadata can also
+contain zeros on successfully programmable blocks. A chip failure is not
+proof of a factory defect. Transport failures, busy timeouts, unexpected WEL,
+configuration changes, input/preservation errors and verification mismatches
+still stop the operation, even with this option. OOB-only preservation reads
+are not bypassed.
+
+The final summary separates programmed and skipped blocks. Exit status zero
+means the requested range was processed under the explicit skip policy,
+**not that skipped blocks were restored**. Any skips produce an
+`INCOMPLETE RESTORATION` warning; skipped blocks are never counted as verified.
 
 The legacy plain `-r`/`-w` paths retain upstream's full-range RAM allocation.
 Use the new paired-file path for the provided large main/OOB images.
@@ -357,7 +405,9 @@ Original notices are retained; no proprietary vendor USB library is linked.
 Hardware-free tests use fake USB/programmer implementations. They cannot
 open a physical programmer. Passing them does not establish electrical or
 hardware compatibility. The read-only hardware comparison above validates
-the tested range. **No real chip has been programmed with this new code yet.**
+the tested range. Earlier paired-write hardware runs stopped with E_FAIL at
+physical block 128; a later capture returned repeated boot-page data there.
+The new skip option has only offline mock validation, not hardware validation.
 
 ```sh
 make -C src -j1 check
@@ -367,6 +417,9 @@ The checks cover CH347 normal/DMA framing and failures, firmware gating,
 HYF main/OOB preservation, range
 mapping (full-chip files and slices), optional verification, ECC-mode handling
 and failure cleanup, plus raw OOB-only and paired reads with fake programmer calls.
+Writer skip cases cover distinct adjacent-block data with both sliced and
+sparse full-chip inputs, erase/program failures, OOB-only preservation,
+all-skipped ranges, and fail-fast transport/configuration/verification cases.
 NAND fixtures use only a few blocks of actual disk/RAM;
 full-chip input mapping is tested with sparse files, not a full-chip buffer.
 Legacy DMA checks also cover caller-owned CS across separate opcode/address/
