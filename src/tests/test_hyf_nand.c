@@ -509,6 +509,119 @@ static void check_skip_bad_blocks(const char *main_path, const char *oob_path)
     check_cleanup();
 }
 
+static void write_blank_fixture(const char *path, size_t page_bytes,
+                                unsigned changed_offset)
+{
+    FILE *stream = fopen(path, "wb");
+    unsigned char page[MAIN_PAGE];
+    assert(stream != NULL);
+    assert(page_bytes <= sizeof(page));
+
+    for (unsigned index = 0; index < PAGES; index++) {
+        memset(page, 0xff, page_bytes);
+        if (index == 16 && changed_offset < page_bytes) {
+            page[changed_offset] = 0;
+        }
+        assert(fwrite(page, 1, page_bytes, stream) == page_bytes);
+    }
+    assert(fclose(stream) == 0);
+}
+
+static void check_erased_page_cases(void)
+{
+    char directory[] = "/tmp/snander-erased-page-test-XXXXXX";
+    char main_path[512], oob_path[512];
+    assert(mkdtemp(directory) != NULL);
+    path_in(main_path, sizeof(main_path), directory, "main.bin");
+    path_in(oob_path, sizeof(oob_path), directory, "oob.bin");
+
+    struct hyf_nand_options options = {
+        .main_path = main_path,
+        .oob_path = oob_path,
+        .address = (uint64_t)BASE_BLOCK * MAIN_BLOCK,
+        .length = MAIN_BLOCK,
+        .verify = true,
+    };
+
+    /* Case0: truly blank. Case1: a software flag in each metadata segment.
+     * Case2: old parity only, discarded in metadata mode. Case3: main only.
+     * Check paired and OOB-only restoration, and raw-mode nonchange too.
+     */
+    for (unsigned preserve = 0; preserve < 2; preserve++) {
+        options.main_path = main_path;
+        if (preserve) {
+            options.main_path = NULL;
+        }
+        for (unsigned raw = 0; raw < 2; raw++) {
+            options.raw = raw != 0;
+            for (unsigned kind = 0; kind < 4; kind++) {
+                unsigned variants = 1;
+                if (kind == 1) {
+                    variants = 4;
+                }
+                for (unsigned segment = 0; segment < variants; segment++) {
+                    unsigned main_offset = MAIN_PAGE;
+                    unsigned spare_offset = OOB_PAGE;
+                    if (kind == 1) {
+                        spare_offset = segment * 32 + 7;
+                    } else if (kind == 2) {
+                        spare_offset = 8;
+                    } else if (kind == 3) {
+                        main_offset = 73;
+                    }
+                    write_blank_fixture(main_path, MAIN_PAGE, main_offset);
+                    write_blank_fixture(oob_path, OOB_PAGE, spare_offset);
+                    reset_mock();
+
+                    if (preserve) {
+                        memset(flash, 0xff, PAGES * PAGE_BYTES);
+                        if (main_offset < MAIN_PAGE) {
+                            flash[16][main_offset] = 0;
+                        }
+                    }
+
+                    assert(hyf_nand_write(&options) == 0);
+                    assert(erase_calls == 1);
+                    assert(page_reads == (preserve + 1) * PAGES);
+                    if (raw) {
+                        assert(execute_calls == PAGES);
+                    } else if (kind == 1 || kind == 3) {
+                        assert(execute_calls == 1);
+                    } else {
+                        assert(execute_calls == 0);
+                    }
+
+                    for (unsigned page = 0; page < PAGES; page++) {
+                        bool programmed = raw ||
+                            (page == 16 && (kind == 1 || kind == 3));
+                        for (unsigned byte = 0; byte < PAGE_BYTES; byte++) {
+                            unsigned char expected = 0xff;
+                            if (!raw && programmed && byte >= MAIN_PAGE &&
+                                (byte - MAIN_PAGE) % 32 >= 8) {
+                                expected = 0xa5; /* Mock ECC, not real parity. */
+                            }
+                            if (page == 16 &&
+                                ((main_offset < MAIN_PAGE && byte == main_offset) ||
+                                 (spare_offset < OOB_PAGE &&
+                                  byte == MAIN_PAGE + spare_offset &&
+                                  (raw || kind == 1)))) {
+                                expected = 0;
+                            }
+                            assert(flash[page][byte] == expected);
+                        }
+                    }
+                    check_untouched_block(1);
+                    check_cleanup();
+                }
+            }
+        }
+    }
+
+    assert(unlink(main_path) == 0);
+    assert(unlink(oob_path) == 0);
+    assert(rmdir(directory) == 0);
+}
+
 int main(void)
 {
     char directory[] = "/tmp/snander-hyf-test-XXXXXX";
@@ -634,6 +747,7 @@ int main(void)
     check_cleanup();
 
     check_skip_bad_blocks(main_path, oob_path);
+    check_erased_page_cases();
 
     reset_mock();
     options.address = (uint64_t)MAIN_BLOCK * 2047;

@@ -57,6 +57,8 @@ struct workspace {
     unsigned char oob[SPARE_BLOCK];
     unsigned char command[3 + PAGE_BYTES];
     unsigned char readback[PAGE_BYTES];
+    uint64_t pages_programmed;
+    uint64_t pages_left_erased;
 };
 
 /* A completed NAND rejection/failure is different from uncertain transport
@@ -276,6 +278,17 @@ static enum block_result erase_block(uint32_t first_row)
     return BLOCK_OK;
 }
 
+static bool page_is_all_ff(const unsigned char *page)
+{
+    for (unsigned byte = 0; byte < PAGE_BYTES; byte++) {
+        if (page[byte] != 0xff) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 static enum block_result program_block(struct workspace *work, uint32_t first_row, bool raw)
 {
     work->command[0] = 0x02;
@@ -299,7 +312,24 @@ static enum block_result program_block(struct workspace *work, uint32_t first_ro
             }
         }
 
-        /* Exactly ONE program-load and ONE execute per erased page. The
+        /* The block was just erased, so a wholly FF metadata-mode payload
+         * needs no PROGRAM. Leave these pages available for the firmware's
+         * later appends rather than first programming their erased contents.
+         * This policy resolved the tested PX2131 stock-restore regression;
+         * it does not assume a particular undocumented page-program limit.
+         *
+         * Inspect the COMPOSED payload: any non-FF software metadata byte
+         * still requires programming, even with entirely FF main data.
+         * Captured parity has already been discarded in metadata mode.
+         * Never compact physical page offsets or omit the block erase.
+         * Raw-mode programming history is deliberately unchanged.
+         */
+        if (!raw && page_is_all_ff(work->command + 3)) {
+            work->pages_left_erased++;
+            continue;
+        }
+
+        /* Exactly ONE program-load and ONE execute per programmed page. The
          * cache receives main+spare together; random-load shortcuts are not
          * substitutes for erase/read-modify-write of existing OOB bytes.
          */
@@ -324,6 +354,8 @@ static enum block_result program_block(struct workspace *work, uint32_t first_ro
                     first_row + page, status);
             return BLOCK_ERROR;
         }
+
+        work->pages_programmed++;
     }
 
     return BLOCK_OK;
@@ -509,6 +541,8 @@ int hyf_nand_write(const struct hyf_nand_options *options)
         puts("RAW: ECC off, all 128 spare bytes written. Supplied parity MUST match main.");
     } else {
         puts("ECC: on; preserve 8 metadata bytes/32-byte spare segment; regenerate parity.");
+        puts("Erased-page policy: fully FF main+metadata pages receive no PROGRAM;"
+             " block erases and physical offsets remain unchanged.");
     }
 
     if (options->verify) {
@@ -534,6 +568,9 @@ int hyf_nand_write(const struct hyf_nand_options *options)
         perror("HYF one-block workspace");
         goto cleanup;
     }
+
+    work->pages_programmed = 0;
+    work->pages_left_erased = 0;
 
     struct sigaction action;
 
@@ -719,6 +756,12 @@ cleanup:
 
     if (oob_input.stream != NULL && fclose(oob_input.stream) != 0) {
         result = -1;
+    }
+
+    if (work != NULL && !options->raw) {
+        printf("HYF page history: %" PRIu64 " page programs completed; "
+               "%" PRIu64 " fully FF pages left erased without PROGRAM.\n",
+               work->pages_programmed, work->pages_left_erased);
     }
 
     free(work);

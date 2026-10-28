@@ -126,13 +126,15 @@ slice. For a full-chip input, the writer seeks to the corresponding physical
 offset. For a slice it starts at byte zero. Main and OOB are mapped independently.
 OOB slice size is main range length divided by 16.
 
-The provided original `hyf2gq4_dump.bin` and `hyf2gq4_oob.bin` captures are in
-`dumps/original` in this workspace. From `/home/appleflyer/dict`, a
-**non-writing** restoration plan is:
+For this PX2131 investigation, `dumps/bkp1` is the working restoration baseline.
+The older `dumps/original` capture failed recovery and is not the working
+baseline. bkp1's ECC-enabled main capture is not a proven matching raw pair;
+use metadata mode to regenerate ECC. From `/home/appleflyer/dict`, a
+**non-writing** working-baseline restoration plan is:
 
 ```sh
-./SNANDer/src/SNANDer -p ch347 -w dumps/original/hyf2gq4_dump.bin \
-  --oob dumps/original/hyf2gq4_oob.bin --oob-mode raw --dry-run
+./SNANDer/src/SNANDer -p ch347 -w dumps/bkp1/hyf2gq4_dump.bin \
+  --oob dumps/bkp1/hyf2gq4_oob.bin --oob-mode metadata --dry-run
 ```
 
 `--dry-run` checks file types/sizes and range alignment. It does not open USB,
@@ -284,21 +286,64 @@ and each 8-byte metadata field in the four 32-byte OOB segments, and let the
 chip generate its 24 ECC-reserved bytes per segment. Captured ECC parity is
 not restored in this mode. Use this for modified main data.
 
+After erasing each block, metadata mode leaves a page unprogrammed if its
+main data **and all four 8-byte software metadata fields** are entirely `FF`.
+An erase already supplies those bytes; issuing PROGRAM as well changes the
+history of a page that firmware may later use for an append. Any non-`FF`
+metadata byte still forces programming, even if the whole main page is `FF`.
+Non-`FF` input parity does not force programming in metadata mode because
+captured parity is discarded. Blocks are still erased, physical coordinates
+never shift, and `-v` still verifies every page, including pages left erased.
+The same policy applies to OOB-only metadata restoration after preserving
+the current main data. The final report separates completed page programs
+from fully `FF` pages left erased; these are not bad-block skips.
+
 `--oob-mode raw` turns ECC off and programs all 2048+128 bytes per page,
 including captured ECC. **The supplied ECC must match the supplied main data.**
 Use matching original main/OOB captures for a raw restoration. Legacy `-d`
 also selects raw mode unless an explicit conflicting metadata mode was given.
+Raw mode retains its previous all-pages programming policy; the blank-page
+change does not alter raw captures or raw restoration.
+
+### PX2131 blank-page restoration regression
+
+The previous paired metadata writer programmed all 64 pages after every erase,
+including pages whose composed main and spare were all `FF`. On this device,
+a full bkp1 stock restoration using that policy reached the menu but later
+logged an ECC/read failure at row `0x18850`, retired logical/physical blocks
+1377/1569, then encountered another read failure and restarted (`test9.txt`).
+The same first failure had appeared with reconstructed code, so it was not
+specific to the reconstruction.
+
+An isolated writer variant changed only metadata-mode blank-page programming.
+After another full bkp1 restoration, the user reported smooth operation.
+`test10.txt` shows a normal stock boot, dictionary entry and return to the
+main screen, with no ECC/read failures, new block retirements or restart.
+The old file-search and serial-number warnings remain. Its SHA256 is
+`09a6f4627ccfa926d89323cf00e9962c166754a9c083b4ef710f0aa31b4d51ca`.
+This hardware result supports leaving blank pages erased; it does not establish
+a manufacturer page-program limit or prove the exact physical failure mechanism.
+It does not yet validate the reconstructed firmware under the corrected policy.
 
 ### Actual writing commands
 
 These commands erase/rewrite the selected physical blocks. Keep stable power.
 They create no backup directories and request no confirmation phrase.
 
-Restore matching full-chip captures, **without read-back verification**:
+Restore the working bkp1 baseline, **without read-back verification**:
 
 ```sh
-sudo ./SNANDer/src/SNANDer -p ch347 -w dumps/original/hyf2gq4_dump.bin \
-  --oob dumps/original/hyf2gq4_oob.bin --oob-mode raw
+sudo ./SNANDer/src/SNANDer -p ch347 -w dumps/bkp1/hyf2gq4_dump.bin \
+  --oob dumps/bkp1/hyf2gq4_oob.bin --oob-mode metadata
+```
+
+For a separate, verified matching raw capture pair, the corresponding raw
+command is below. Replace both placeholder paths with that pair; do not use
+bkp1's ECC-enabled main file with captured raw parity.
+
+```sh
+sudo ./SNANDer/src/SNANDer -p ch347 -w verified_matching_main.bin \
+  --oob verified_matching_oob.bin --oob-mode raw
 ```
 
 To limit that operation, append `-a ADDRESS -l LENGTH`. For example,
@@ -308,12 +353,15 @@ inputs automatically seeking to that block's main/OOB data.
 Replace OOB metadata while retaining the connected chip's current main data:
 
 ```sh
-sudo ./SNANDer/src/SNANDer -p ch347 --write-oob dumps/original/hyf2gq4_oob.bin
+sudo ./SNANDer/src/SNANDer -p ch347 --write-oob dumps/bkp1/hyf2gq4_oob.bin \
+  --oob-mode metadata
 ```
 
 This is **not an in-place spare-only program**. NAND erase clears main and OOB
 together, so each block's main data is first read into RAM, then the block is
-erased and all 64 pages are programmed with the replacement OOB metadata.
+erased and nonempty composed pages are programmed with the replacement OOB
+metadata. Fully `FF` main+metadata pages remain erased in metadata mode;
+raw mode still programs all 64 pages.
 Default ECC mode preserves corrected main data and refuses an uncorrectable
 read before erasing that block. Raw OOB-only mode is also available, but old
 parity may be invalid for the current main data; there is no automatic parity
@@ -344,14 +392,14 @@ restored on cleanup where communication permits.
 writers only. It is not the inherited `-k` option and cannot be combined with
 it. Reads, standalone `-e`, and legacy main-only writes reject the new flag.
 
-For example, to resume a matching main/OOB restoration at physical block 128:
+For example, to resume a working-bkp1 restoration at physical block 128:
 
 ```sh
 cd /home/appleflyer/dict
 sudo ./SNANDer/src/SNANDer -p ch347 --spi-clock 7500000 \
   --ch347-mode normal -a 0x01000000 \
-  -w dumps/original/hyf2gq4_dump.bin \
-  --oob dumps/original/hyf2gq4_oob.bin --oob-mode raw \
+  -w dumps/bkp1/hyf2gq4_dump.bin \
+  --oob dumps/bkp1/hyf2gq4_oob.bin --oob-mode metadata \
   --skip-bad-blocks
 ```
 
@@ -420,6 +468,9 @@ and failure cleanup, plus raw OOB-only and paired reads with fake programmer cal
 Writer skip cases cover distinct adjacent-block data with both sliced and
 sparse full-chip inputs, erase/program failures, OOB-only preservation,
 all-skipped ranges, and fail-fast transport/configuration/verification cases.
+Blank-page cases cover paired and OOB-only writes, all four metadata fields,
+discarded input parity, main-only content, raw-mode nonchange, unconditional
+block erasure, physical page placement and verification of pages left erased.
 NAND fixtures use only a few blocks of actual disk/RAM;
 full-chip input mapping is tested with sparse files, not a full-chip buffer.
 Legacy DMA checks also cover caller-owned CS across separate opcode/address/
